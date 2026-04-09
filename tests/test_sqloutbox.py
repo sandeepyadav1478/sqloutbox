@@ -495,3 +495,70 @@ def test_full_cycle_next_batch_fresh_chain(db_path):
     # Chain verifies cleanly (no sync_log bridging needed — fresh head)
     ok, gaps = ob.verify_chain(rows)
     assert ok is True, f"Fresh chain should verify cleanly; gaps={gaps}"
+
+
+# ── seed_sequence() ──────────────────────────────────────────────────────────
+
+
+def test_seed_sequence_advances_counter(db_path):
+    """seed_sequence sets sqlite_sequence above the given min_seq."""
+    ob = Outbox(db_path=db_path, namespace="seed-ns")
+    advanced = ob.seed_sequence(10_000)
+    assert advanced is True
+
+    # Next enqueue should get a seq > 10_000
+    seq = ob.enqueue("t", b"after-seed")
+    assert seq is not None
+    assert seq > 10_000
+
+
+def test_seed_sequence_noop_when_already_higher(db_path):
+    """seed_sequence is a no-op when the counter is already above min_seq."""
+    ob = Outbox(db_path=db_path, namespace="seed-ns")
+    # Insert some rows to advance the counter
+    for _ in range(5):
+        ob.enqueue("t", b"x")
+
+    conn = sqlite3.connect(db_path)
+    current = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'outbox_queue'"
+    ).fetchone()[0]
+    conn.close()
+
+    # Try to seed with a value below current
+    advanced = ob.seed_sequence(1)
+    assert advanced is False
+
+    # Counter should not have changed
+    conn = sqlite3.connect(db_path)
+    after = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'outbox_queue'"
+    ).fetchone()[0]
+    conn.close()
+    assert after == current
+
+
+def test_seed_sequence_on_fresh_db(tmp_path):
+    """seed_sequence works on a fresh DB with no prior inserts."""
+    db = tmp_path / "fresh.db"
+    ob = Outbox(db_path=db, namespace="fresh-ns")
+
+    advanced = ob.seed_sequence(50_000)
+    assert advanced is True
+
+    seq = ob.enqueue("t", b"first-event")
+    assert seq is not None
+    assert seq > 50_000
+
+
+def test_seed_sequence_chain_integrity_after_seed(db_path):
+    """Chain integrity is preserved after seeding."""
+    ob = Outbox(db_path=db_path, namespace="chain-seed-ns")
+    ob.seed_sequence(100_000)
+
+    seqs = ob.enqueue_batch([("t", b"a"), ("t", b"b"), ("t", b"c")])
+    assert all(s > 100_000 for s in seqs)
+
+    rows = ob.fetch_unsynced()
+    ok, gaps = ob.verify_chain(rows)
+    assert ok is True, f"Chain should be intact after seeding; gaps={gaps}"

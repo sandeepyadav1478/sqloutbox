@@ -93,8 +93,9 @@ class OutboxWriter(Protocol):
         -------
         list[dict]
             One result dict per statement (in order):
-                {"ok": True,  "rows_affected": N}  — confirmed
-                {"ok": False, "error": "..."}       — failed (retried next cycle)
+                {"ok": True,  "rows_affected": N}           — write confirmed
+                {"ok": True,  "rows": [[col, ...], ...]}    — SELECT result
+                {"ok": False, "error": "..."}                — failed
         """
         ...
 
@@ -207,16 +208,24 @@ class OutboxSyncService:
         self._flush_interval = config.flush_interval
         self._cycle_count = 0
 
-        config.db_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create per-target per-table Outbox instances from config
+        # Create per-target per-table Outbox instances from config.
+        # Each target may have its own db_dir (set by TOML loader for
+        # per-app isolation) or fall back to config.db_dir.
         self._target_outboxes: dict[str, dict[str, Outbox]] = {}
+        _seen_dirs: set[str] = set()
         for target in config.targets:
+            db_dir = target.db_dir or config.db_dir
+            batch_size = target.batch_size or config.batch_size
+            dir_key = str(db_dir)
+            if dir_key not in _seen_dirs:
+                db_dir.mkdir(parents=True, exist_ok=True)
+                _seen_dirs.add(dir_key)
             self._target_outboxes[target.name] = {
                 table: Outbox(
-                    db_path=config.db_dir / f"{table}.db",
+                    db_path=db_dir / f"{table}.db",
                     namespace=table,
-                    batch_size=config.batch_size,
+                    batch_size=batch_size,
+                    retain_log_days=target.get_retain_days(table),
                 )
                 for table in target.tables
             }
@@ -234,6 +243,7 @@ class OutboxSyncService:
             [t.name for t in self._config.targets],
         )
         await self._ensure_schema()
+        await self._seed_from_remote()
         await self._worker_loop()
 
     # ── Schema setup ────────────────────────────────────────────────────────
@@ -264,35 +274,55 @@ class OutboxSyncService:
             if not writer:
                 continue
 
-            if target.inject_outbox_seq:
-                await self._add_outbox_seq(target, writer)
-            else:
-                await self._drop_outbox_seq(target, writer)
+            add_tables = [t for t in target.tables
+                          if target.should_inject_seq(t)]
+            drop_tables = [t for t in target.tables
+                           if not target.should_inject_seq(t)]
+            if add_tables:
+                await self._add_outbox_seq(target, writer, add_tables)
+            if drop_tables:
+                await self._drop_outbox_seq(target, writer, drop_tables)
 
     async def _add_outbox_seq(
         self, target: TargetConfig, writer: OutboxWriter,
+        tables: list[str],
     ) -> None:
-        """ADD outbox_seq column to tables for this target."""
-        stmts: list[tuple[str, list[Any]]] = [
-            (f"ALTER TABLE {table} ADD COLUMN outbox_seq INTEGER UNIQUE", [])
-            for table in target.tables
-        ]
+        """ADD outbox_seq column + partial unique index to specified tables.
+
+        Two statements per table:
+            1. ALTER TABLE … ADD COLUMN outbox_seq INTEGER NOT NULL DEFAULT 0
+            2. CREATE UNIQUE INDEX … WHERE outbox_seq != 0
+        """
+        stmts: list[tuple[str, list[Any]]] = []
+        for table in tables:
+            stmts.append((
+                f"ALTER TABLE {table} ADD COLUMN "
+                f"outbox_seq INTEGER NOT NULL DEFAULT 0",
+                [],
+            ))
+            stmts.append((
+                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_outbox_seq "
+                f"ON {table} (outbox_seq) WHERE outbox_seq != 0",
+                [],
+            ))
         if not stmts:
             return
 
         logger.info(
             "[outbox_sync] auto-schema: ADD outbox_seq to %s tables: %s",
-            target.name, list(target.tables),
+            target.name, tables,
         )
         try:
             results = await writer.write_batch(stmts)
             for i, result in enumerate(results):
-                table = target.tables[i]
+                # Two stmts per table: ALTER (even index) + CREATE INDEX (odd)
+                table = tables[i // 2]
                 if result.get("ok"):
-                    logger.info(
-                        "[outbox_sync] added outbox_seq column to %s.%s",
-                        target.name, table,
-                    )
+                    if i % 2 == 0:
+                        logger.info(
+                            "[outbox_sync] added outbox_seq column to %s.%s",
+                            target.name, table,
+                        )
                 else:
                     err = result.get("error", "")
                     if "duplic" in err.lower() or "already" in err.lower():
@@ -313,31 +343,44 @@ class OutboxSyncService:
 
     async def _drop_outbox_seq(
         self, target: TargetConfig, writer: OutboxWriter,
+        tables: list[str],
     ) -> None:
-        """DROP outbox_seq column from tables for this target (cleanup)."""
-        stmts: list[tuple[str, list[Any]]] = [
-            (f"ALTER TABLE {table} DROP COLUMN outbox_seq", [])
-            for table in target.tables
-        ]
+        """DROP partial unique index + outbox_seq column from specified tables.
+
+        Two statements per table:
+            1. DROP INDEX IF EXISTS idx_{table}_outbox_seq
+            2. ALTER TABLE … DROP COLUMN outbox_seq
+        """
+        stmts: list[tuple[str, list[Any]]] = []
+        for table in tables:
+            stmts.append((
+                f"DROP INDEX IF EXISTS idx_{table}_outbox_seq",
+                [],
+            ))
+            stmts.append((
+                f"ALTER TABLE {table} DROP COLUMN outbox_seq",
+                [],
+            ))
         if not stmts:
             return
 
         logger.info(
             "[outbox_sync] auto-schema: DROP outbox_seq from %s tables: %s",
-            target.name, list(target.tables),
+            target.name, tables,
         )
         try:
             results = await writer.write_batch(stmts)
             for i, result in enumerate(results):
-                table = target.tables[i]
+                # Two stmts per table: DROP INDEX (even) + ALTER (odd)
+                table = tables[i // 2]
                 if result.get("ok"):
-                    logger.info(
-                        "[outbox_sync] dropped outbox_seq column from %s.%s",
-                        target.name, table,
-                    )
+                    if i % 2 == 1:
+                        logger.info(
+                            "[outbox_sync] dropped outbox_seq column from %s.%s",
+                            target.name, table,
+                        )
                 else:
                     err = result.get("error", "")
-                    # Column doesn't exist — expected if never added
                     if "no such" in err.lower() or "does not exist" in err.lower():
                         logger.debug(
                             "[outbox_sync] outbox_seq not present on %s.%s — nothing to drop",
@@ -353,6 +396,74 @@ class OutboxSyncService:
                 "[outbox_sync] schema DROP failed for target '%s': %s",
                 target.name, exc,
             )
+
+    # ── Sequence seeding ─────────────────────────────────────────────────────
+
+    async def _seed_from_remote(self) -> None:
+        """Seed local AUTOINCREMENT counters from remote ``MAX(outbox_seq)``.
+
+        On a fresh machine the local SQLite starts sequences from 1, which
+        would collide with ``outbox_seq`` values already in the remote DB.
+        ``INSERT OR IGNORE`` would then silently drop new events.
+
+        For each target+table with ``inject_outbox_seq=True``, this method
+        queries the remote DB for ``MAX(outbox_seq)`` and advances the
+        local ``sqlite_sequence`` counter above that value.
+
+        Runs once at startup, after ``_ensure_schema()`` (so the column
+        exists) and before ``_worker_loop()`` (so new enqueues get safe
+        sequences).
+
+        Errors are logged but not fatal — the service continues with
+        whatever local sequence exists. This is safe because:
+        - If the remote DB is empty, the local counter is fine at 1.
+        - If the remote DB has data but the query fails, the next
+          successful seed (on restart) will catch up.
+        """
+        for target in self._config.targets:
+            writer = self._writers.get(target.name)
+            if not writer:
+                continue
+
+            inject_tables = [t for t in target.tables
+                             if target.should_inject_seq(t)]
+            if not inject_tables:
+                continue
+
+            # One SELECT per table, batched into a single write_batch call
+            stmts: list[tuple[str, list[Any]]] = [
+                (f"SELECT MAX(outbox_seq) FROM {table} WHERE outbox_seq != 0", [])
+                for table in inject_tables
+            ]
+
+            try:
+                results = await writer.write_batch(stmts)
+            except Exception as exc:
+                logger.warning(
+                    "[outbox_sync] seed query failed for target '%s': %s "
+                    "— continuing with local sequence",
+                    target.name, exc,
+                )
+                continue
+
+            outboxes = self._target_outboxes.get(target.name, {})
+            for i, table in enumerate(inject_tables):
+                result = results[i] if i < len(results) else {}
+                if not result.get("ok"):
+                    logger.debug(
+                        "[outbox_sync] seed query failed for %s.%s: %s",
+                        target.name, table, result.get("error", "unknown"),
+                    )
+                    continue
+
+                rows = result.get("rows", [])
+                if not rows or rows[0][0] is None:
+                    continue  # no outbox_seq in remote — nothing to seed
+
+                max_remote_seq = int(rows[0][0])
+                outbox = outboxes.get(table)
+                if outbox:
+                    outbox.seed_sequence(max_remote_seq)
 
     # ── Background worker ────────────────────────────────────────────────────
 
@@ -445,7 +556,7 @@ class OutboxSyncService:
                     for row in rows:
                         sql = row.tag
                         args = json.loads(row.payload.decode())
-                        if target.inject_outbox_seq:
+                        if target.should_inject_seq(table):
                             sql, args = inject_outbox_seq(sql, args, row.seq)
                         all_stmts.append((sql, args))
                         stmt_info.append((table, row.seq))

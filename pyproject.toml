@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqloutbox"
-version = "0.2.0"
-description = "Standalone SQLite transactional outbox service — config-driven multi-target sync daemon, middleware base class, and chain-integrity verification"
+version = "0.3.0"
+description = "Config-driven SQLite transactional outbox — multi-app TOML config, per-table injection control, .env/Doppler credential loading, multi-target sync daemon"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,7 +13,7 @@ authors = [{ name = "Sandeep Yadav" }]
 keywords = [
     "outbox", "sqlite", "queue", "durable", "event-sourcing",
     "messaging", "transactional-outbox", "linked-list",
-    "sync-daemon", "middleware",
+    "sync-daemon", "middleware", "toml-config", "doppler",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -30,7 +30,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
 ]
-dependencies = []   # stdlib only — sqlite3, pathlib, dataclasses, logging, asyncio, json
+dependencies = []   # stdlib only — sqlite3, pathlib, dataclasses, logging, asyncio, json, tomllib (3.11+)
 
 [project.scripts]
 sqloutbox = "sqloutbox.cli:main"
@@ -47,6 +47,7 @@ packages = ["src/sqloutbox"]
 include = ["src/", "README.md", "LICENSE"]
 
 [project.optional-dependencies]
+toml = ["tomli>=2.0; python_version < '3.11'"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.pytest.ini_options]

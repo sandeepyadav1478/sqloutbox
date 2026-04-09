@@ -1,28 +1,33 @@
-"""sqloutbox CLI — scaffold a config directory for the drain service.
+"""sqloutbox CLI — scaffold config and run the drain service.
 
 Usage::
 
-    sqloutbox init [DIR]      Scaffold a config directory (default: ./outbox)
+    sqloutbox init [DIR]                  Scaffold a config directory (Python)
+    sqloutbox runservice [--config FILE]  Start drain service from TOML config
 
-The scaffolded directory contains everything needed to run the service:
+Quick start (TOML — recommended)::
 
-    outbox_config.py    OutboxConfig + create_writers() factory
-    run_service.py      Entry point — run this to start the drain service
-    logging.json        Python logging dict config
-    data/               SQLite outbox files (created at runtime)
+    # 1. Create outbox.toml (manually or copy from docs)
+    # 2. Run the service:
+    sqloutbox runservice                      # reads ./outbox.toml
+    sqloutbox runservice --config my.toml     # reads custom file
 
-Start the service::
+Quick start (Python — for complex bootstrapping)::
 
-    python outbox/run_service.py
+    sqloutbox init [DIR]                 # scaffold Python config + runner
+    python outbox/run_service.py         # start the service
 
-Or in a systemd unit::
+Systemd unit::
 
-    ExecStart=/usr/bin/python /home/app/outbox/run_service.py
+    ExecStart=/usr/bin/python -m sqloutbox runservice --config /path/to/outbox.toml
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import logging
+import os
 import sys
 from pathlib import Path
 
@@ -33,7 +38,7 @@ _DEFAULT_DIR = "outbox"
 
 
 _CONFIG_TEMPLATE = '''\
-"""sqloutbox outbox configuration.
+"""sqloutbox outbox configuration (Python mode).
 
 This file is imported by run_service.py. It must export two names:
 
@@ -42,6 +47,9 @@ This file is imported by run_service.py. It must export two names:
 
 Start the service:
     python outbox/run_service.py
+
+Alternative: use TOML config mode instead (recommended for most projects):
+    sqloutbox runservice --config outbox.toml
 
 Multi-database routing
 ----------------------
@@ -54,6 +62,22 @@ database credentials and writer:
 
 The sync service collects ALL pending statements for a target into ONE
 writer.write_batch() call per cycle, minimising HTTP round-trips per DB.
+
+inject_outbox_seq control
+-------------------------
+Controls which tables get ``outbox_seq`` column injection for idempotent delivery.
+Can be set at three levels of granularity:
+
+    True                                — all tables in this target get injection
+    False                               — no tables get injection
+    frozenset({"events", "metrics"})    — only named tables get injection
+
+Per-table control example (mixed):
+    TargetConfig(
+        name="analytics",
+        tables=("events", "metrics", "raw_log"),
+        inject_outbox_seq=frozenset({"events", "metrics"}),  # raw_log excluded
+    )
 """
 
 import os
@@ -68,42 +92,10 @@ from sqloutbox import OutboxConfig, TargetConfig
 DB_DIR = Path(__file__).parent / "data"
 
 
-# ── Database 1 ───────────────────────────────────────────────────────────────
+# ── Target: analytics ────────────────────────────────────────────────────────
 #
 # Each target ties a set of tables to a specific remote database.
 # The target name must match a key in create_writers() below.
-#
-# TargetConfig fields:
-#
-#   name               Unique label — matches a key in the writers dict.
-#
-#   tables             Tuple of outbox namespaces routed to this database.
-#                      Each table gets its own SQLite file: {DB_DIR}/{table}.db.
-#
-#   inject_outbox_seq  (default: True)
-#                      When True, the sync service appends an outbox_seq column
-#                      to every INSERT and UPDATE before sending to the remote DB:
-#
-#                        INSERT INTO t (a, b) VALUES (?, ?)
-#                        → INSERT OR IGNORE INTO t (a, b, outbox_seq) VALUES (?, ?, ?)
-#
-#                        UPDATE t SET a=?, b=? WHERE id=?
-#                        → UPDATE t SET a=?, b=?, outbox_seq=? WHERE id=?
-#
-#                      Benefits:
-#                        • INSERT OR IGNORE = idempotent delivery (crash-safe)
-#                        • outbox_seq on remote = gap detection (no missed syncs)
-#                        • Unique per row = cross-check local vs remote
-#
-#                      When auto_schema=True (default), the sync service manages
-#                      this column automatically on startup:
-#                        inject_outbox_seq=True  → ADD COLUMN outbox_seq INTEGER UNIQUE
-#                        inject_outbox_seq=False → DROP COLUMN outbox_seq (cleanup)
-#                      Both are idempotent — safe on every restart.
-#
-#                      Prefer manual migrations (Alembic, Django, etc.)?
-#                      Set auto_schema=False and use config.schema_sql() /
-#                      config.drop_schema_sql() to generate the DDL yourself.
 
 ANALYTICS_DB_URL   = os.environ.get("ANALYTICS_DB_URL", "")
 ANALYTICS_DB_TOKEN = os.environ.get("ANALYTICS_DB_TOKEN", "")
@@ -115,21 +107,19 @@ _ANALYTICS = TargetConfig(
         "metrics",
         "api_calls",
     ),
-    inject_outbox_seq=True,
+    inject_outbox_seq=True,      # all tables get outbox_seq injection
+    batch_size=500,              # per-target batch size override
 )
 
 
-# ── Database 2 (optional — uncomment to enable multi-DB routing) ─────────────
-#
-# Route a different set of tables to a second database.
-# Each table belongs to exactly ONE target — no overlaps.
+# ── Target: billing (optional — uncomment to enable multi-DB routing) ────────
 
 # BILLING_DB_URL   = os.environ.get("BILLING_DB_URL", "")
 # BILLING_DB_TOKEN = os.environ.get("BILLING_DB_TOKEN", "")
 #
 # _BILLING = TargetConfig(
 #     name="billing",
-#     tables=(                   # ← tables that live in the billing database
+#     tables=(
 #         "invoices",
 #         "payments",
 #     ),
@@ -138,42 +128,6 @@ _ANALYTICS = TargetConfig(
 
 
 # ── OutboxConfig ─────────────────────────────────────────────────────────────
-#
-#   db_dir           Directory for SQLite outbox files (required).
-#
-#   targets          Tuple of TargetConfig entries (see above).
-#                    An empty tuple is valid for middleware-only use (no sync).
-#
-#   batch_size       Max rows fetched per table per sync cycle. Higher values
-#                    reduce round-trips but increase memory and remote batch
-#                    size. Default: 500.
-#
-#   flush_interval   Seconds between round-robin scan passes. Default: 1.0.
-#
-#   table_flush_threshold
-#                    Min pending rows to trigger immediate flush per table.
-#                    Default: 15.
-#
-#   table_max_wait   Max seconds a table can have any pending rows before
-#                    flush — even below the threshold. Default: 6.0.
-#
-#   auto_schema      When True (default), the sync service auto-manages the
-#                    outbox_seq column on remote tables at startup:
-#                      inject_outbox_seq=True  → ADD COLUMN
-#                      inject_outbox_seq=False → DROP COLUMN (cleanup)
-#                    Set to False if you manage schema via migration tools
-#                    (Alembic, Django, etc.). Use config.schema_sql() and
-#                    config.drop_schema_sql() to generate DDL yourself.
-#
-#   cleanup_every    Run prune_sync_log() every N cycles to trim the audit
-#                    trail (outbox_sync_log table in each SQLite file).
-#                    Default: 500 (= every ~2 hours at 15s interval).
-#
-#   retain_log_days  Days to keep delivered-row records in the outbox_sync_log
-#                    table before pruning. These records are used for chain
-#                    gap verification — after pruning, the chain gap checker
-#                    cannot distinguish "delivered and pruned" from "lost".
-#                    Default: 7.
 
 config = OutboxConfig(
     db_dir=DB_DIR,
@@ -181,51 +135,26 @@ config = OutboxConfig(
         _ANALYTICS,
         # _BILLING,             # ← uncomment for multi-DB
     ),
-    batch_size=500,
-    # Round-robin drain: scan every 1s, flush when 15+ rows OR 6s elapsed
-    # flush_interval=1.0,       # scan interval (default: 1.0s)
-    # table_flush_threshold=15, # row count trigger (default: 15)
-    # table_max_wait=6.0,       # time trigger (default: 6.0s)
-    # auto_schema=True,         # auto ADD/DROP outbox_seq on remote tables
-    cleanup_every=500,
-    retain_log_days=7,
+    batch_size=500,              # default for targets that don't override
+    flush_interval=1.0,          # seconds between round-robin scans
+    table_flush_threshold=15,    # pending rows to trigger immediate flush
+    table_max_wait=6.0,          # max seconds before forcing flush
+    auto_schema=True,            # auto ADD/DROP outbox_seq on remote tables
+    cleanup_every=500,           # prune audit trail every N cycles
+    retain_log_days=7,           # days to keep outbox_sync_log records
 )
 
 
 # ── Writers ──────────────────────────────────────────────────────────────────
 #
-# One writer per target (= one writer per remote database).
-# Each writer must implement the OutboxWriter protocol:
+# One writer per target. Must implement the OutboxWriter protocol:
 #
-#   class OutboxWriter(Protocol):
-#       async def write_batch(
-#           self, stmts: list[tuple[str, list]]
-#       ) -> list[dict]:
-#           """Send SQL statements to the remote database.
-#
-#           Parameters:
-#               stmts: List of (sql_string, bind_args) tuples.
-#
-#           Returns:
-#               One result dict per statement, in order:
-#                 {"ok": True,  "rows_affected": N}   -- confirmed
-#                 {"ok": False, "error": "message"}    -- failed (retried next cycle)
-#           """
-#           ...
-#
-# The sync service calls write_batch() once per target per cycle with ALL
-# pending statements for that target. This minimises HTTP round-trips.
-#
-# sqloutbox never imports httpx, requests, or any external HTTP library.
-# Your writer is the only bridge to the network.
+#   async def write_batch(self, stmts: list[tuple[str, list]]) -> list[dict]:
+#       """Return [{"ok": True, "rows_affected": N}] per stmt."""
 
 
 class TursoWriter:
-    """Turso / libSQL HTTP pipeline writer.
-
-    Sends all statements in ONE HTTP request. Both "new insert" and
-    "INSERT OR IGNORE duplicate" count as confirmed — data IS in the DB.
-    """
+    """Turso / libSQL HTTP pipeline writer."""
 
     def __init__(self, db_url: str, db_token: str) -> None:
         self._pipeline_url = f"{db_url}/v2/pipeline"
@@ -261,26 +190,23 @@ class TursoWriter:
                 })
             else:
                 r = entry["response"]["result"]
-                results.append({"ok": True, "rows_affected": r.get("rows_affected", 0)})
+                result = {"ok": True, "rows_affected": r.get("rows_affected", 0)}
+                # Include rows for SELECT queries (used by seed_from_remote)
+                if "rows" in r:
+                    result["rows"] = [
+                        [col.get("value") for col in row]
+                        for row in r["rows"]
+                    ]
+                results.append(result)
         return results
 
 
 def create_writers() -> dict:
-    """Create one writer per target — each connects to its own database.
-
-    The dict keys must match the target names defined above.
-
-    Returns:
-        {"analytics": writer_for_analytics_db, "billing": writer_for_billing_db, ...}
-    """
+    """Create one writer per target — keys must match target names."""
     writers = {
-        # analytics target → analytics database
         "analytics": TursoWriter(ANALYTICS_DB_URL, ANALYTICS_DB_TOKEN),
     }
-
-    # Uncomment for multi-DB routing:
     # writers["billing"] = TursoWriter(BILLING_DB_URL, BILLING_DB_TOKEN)
-
     return writers
 '''
 
@@ -475,13 +401,56 @@ def cmd_init(config_dir: Path) -> None:
     print(f"  1. Edit {config_dir}/outbox_config.py — define your targets and writers")
     print(f"  2. Run:  python {config_dir}/run_service.py")
     print()
-    print(f"  Schema management (auto_schema=True by default):")
-    print(f"    inject_outbox_seq=True  → auto ADD outbox_seq column on startup")
-    print(f"    inject_outbox_seq=False → auto DROP outbox_seq column (cleanup)")
-    print(f"  Using migration tools? Set auto_schema=False and run DDL yourself:")
-    print(f"       python -c \"from outbox_config import config; print('\\n'.join(config.schema_sql()))\"")
-    print(f"       python -c \"from outbox_config import config; print('\\n'.join(config.drop_schema_sql()))\"")
+    print(f"  Alternative: use TOML config mode (recommended for most projects):")
+    print(f"    sqloutbox runservice --config outbox.toml")
+    print(f"    See: https://github.com/sandeepyadav1478/sqloutbox#toml-config")
 
+
+# ── runservice command ───────────────────────────────────────────────────────
+
+
+def cmd_runservice(config_path: Path | None) -> None:
+    """Start the outbox drain service from a TOML config file.
+
+    Resolution order:
+        1. ``--config <file>`` → use that file
+        2. No flag → look for ``outbox.toml`` in cwd
+        3. Neither exists → error with usage hint
+    """
+    from sqloutbox._runner import DEFAULT_CONFIG_FILE, run_service_main
+
+    if config_path is None:
+        config_path = Path(DEFAULT_CONFIG_FILE)
+
+    if not config_path.exists():
+        if config_path.name == DEFAULT_CONFIG_FILE:
+            print(
+                f"error: config file not found: {config_path}\n\n"
+                f"Provide a config file:\n"
+                f"  sqloutbox runservice --config <file.toml>\n\n"
+                f"Or create '{DEFAULT_CONFIG_FILE}' in the current directory.\n"
+                f"See: https://github.com/sandeepyadav1478/sqloutbox#toml-config",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"error: config file not found: {config_path}",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    # Setup logging (respects LOG_LEVEL env var)
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    try:
+        asyncio.run(run_service_main(config_path))
+    except KeyboardInterrupt:
+        pass
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -495,9 +464,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     sub = parser.add_subparsers(dest="command")
 
-    p_init = sub.add_parser("init", help="scaffold a config directory")
+    p_init = sub.add_parser("init", help="scaffold a Python config directory")
     p_init.add_argument("dir", nargs="?", default=_DEFAULT_DIR,
                         help="config directory (default: ./outbox)")
+
+    p_run = sub.add_parser(
+        "runservice",
+        help="start drain service from TOML config",
+    )
+    p_run.add_argument(
+        "--config", "-c", type=Path, default=None,
+        help="TOML config file (default: ./outbox.toml)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -507,3 +485,5 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "init":
         cmd_init(Path(args.dir))
+    elif args.command == "runservice":
+        cmd_runservice(args.config)

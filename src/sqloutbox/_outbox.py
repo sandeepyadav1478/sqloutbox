@@ -16,7 +16,7 @@ from sqloutbox._schema import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_RETAIN_LOG_DAYS = 7
+DEFAULT_RETAIN_LOG_DAYS = 30
 DEFAULT_BATCH_SIZE      = 50
 DEFAULT_CLEANUP_EVERY   = 500
 
@@ -354,6 +354,47 @@ class Outbox:
                 [self.namespace],
             ).fetchone()
         return row[0] if row else 0
+
+    # ── Seeding ──────────────────────────────────────────────────────────────
+
+    def seed_sequence(self, min_seq: int) -> bool:
+        """Ensure the AUTOINCREMENT counter is at least ``min_seq``.
+
+        On a fresh machine the local SQLite file starts sequences from 1,
+        which collides with ``outbox_seq`` values already delivered to the
+        remote DB.  ``INSERT OR IGNORE`` would silently drop new events.
+
+        Call this at startup with ``MAX(outbox_seq)`` from the remote DB
+        so the local counter begins above the highest value already delivered.
+
+        Returns True if the counter was advanced, False if it was already
+        high enough (no-op).
+        """
+        row = self._write_conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'outbox_queue'"
+        ).fetchone()
+        current = row[0] if row and row[0] is not None else 0
+
+        if current >= min_seq:
+            return False
+
+        if row is None:
+            # Fresh DB — no rows ever inserted, sqlite_sequence has no entry.
+            self._write_conn.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('outbox_queue', ?)",
+                [min_seq],
+            )
+        else:
+            self._write_conn.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'outbox_queue'",
+                [min_seq],
+            )
+        self._write_conn.commit()
+        logger.info(
+            "sqloutbox[%s]: seeded sequence from %d → %d (remote max)",
+            self.namespace, current, min_seq,
+        )
+        return True
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

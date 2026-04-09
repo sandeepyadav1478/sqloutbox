@@ -121,7 +121,14 @@ class MockWriter:
         self.calls.append(stmts)
         if self._results is not None:
             return self._results
-        return [{"ok": True, "rows_affected": 1} for _ in stmts]
+        # Return rows for SELECT queries (seed_from_remote support)
+        out = []
+        for sql, _ in stmts:
+            if sql.strip().upper().startswith("SELECT"):
+                out.append({"ok": True, "rows": [[None]]})
+            else:
+                out.append({"ok": True, "rows_affected": 1})
+        return out
 
 
 def test_mock_writer_is_outbox_writer():
@@ -183,8 +190,9 @@ async def test_sync_service_drains_outbox(tmp_path):
     # All data stmts should have outbox_seq injected (default inject_outbox_seq=True)
     for call in writer.calls:
         for sql, args in call:
-            if sql.upper().startswith("ALTER"):
-                continue  # schema setup call on startup
+            upper = sql.upper()
+            if upper.startswith("ALTER") or upper.startswith("CREATE") or upper.startswith("SELECT"):
+                continue  # schema setup + seed queries on startup
             assert "INSERT OR IGNORE INTO" in sql
             assert "outbox_seq" in sql
 
@@ -223,8 +231,9 @@ async def test_sync_service_no_inject_when_disabled(tmp_path):
     assert len(writer.calls) >= 1
     for call in writer.calls:
         for sql, args in call:
-            if sql.upper().startswith("ALTER"):
-                continue  # schema management call on startup
+            upper = sql.upper()
+            if upper.startswith("ALTER") or upper.startswith("DROP") or upper.startswith("CREATE"):
+                continue  # schema management calls on startup
             assert "outbox_seq" not in sql
             assert "INSERT OR IGNORE" not in sql
 
@@ -352,12 +361,17 @@ async def test_sync_service_auto_schema_false_skips_ddl(tmp_path):
     except asyncio.CancelledError:
         pass
 
-    # Writer should have data calls but NO ALTER TABLE
+    # Writer should have data calls but NO DDL (no ALTER, CREATE INDEX, DROP)
     assert len(writer.calls) >= 1
     for call in writer.calls:
         for sql, args in call:
-            assert not sql.upper().startswith("ALTER"), \
+            upper = sql.upper()
+            assert not upper.startswith("ALTER"), \
                 f"auto_schema=False but got ALTER: {sql}"
+            assert not upper.startswith("CREATE"), \
+                f"auto_schema=False but got CREATE: {sql}"
+            assert not upper.startswith("DROP"), \
+                f"auto_schema=False but got DROP: {sql}"
 
 
 @pytest.mark.asyncio
@@ -385,10 +399,146 @@ async def test_sync_service_drops_column_when_disabled(tmp_path):
     except asyncio.CancelledError:
         pass
 
-    # First call should be the DROP COLUMN
+    # First call should be DROP INDEX + DROP COLUMN (2 stmts per table)
     assert len(writer.calls) >= 1
     first_call = writer.calls[0]
-    assert len(first_call) == 1
-    sql, args = first_call[0]
-    assert "DROP COLUMN outbox_seq" in sql
-    assert "audit_log" in sql
+    assert len(first_call) == 2
+    # Statement 1: DROP INDEX
+    sql0, _ = first_call[0]
+    assert "DROP INDEX" in sql0
+    assert "audit_log" in sql0
+    # Statement 2: ALTER TABLE DROP COLUMN
+    sql1, _ = first_call[1]
+    assert "DROP COLUMN outbox_seq" in sql1
+    assert "audit_log" in sql1
+
+
+# ── _seed_from_remote ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_seed_from_remote_advances_sequence(tmp_path):
+    """_seed_from_remote queries MAX(outbox_seq) and seeds the local counter."""
+    target = TargetConfig(name="primary", tables=("events",))
+    config = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(target,),
+        flush_interval=0.1,
+        table_max_wait=0.1,
+    )
+
+    # Writer that returns MAX(outbox_seq) = 50000 for the seed query
+    class SeedWriter:
+        def __init__(self):
+            self.calls = []
+
+        async def write_batch(self, stmts):
+            self.calls.append(stmts)
+            results = []
+            for sql, _ in stmts:
+                upper = sql.strip().upper()
+                if upper.startswith("SELECT"):
+                    results.append({"ok": True, "rows": [[50000]]})
+                else:
+                    results.append({"ok": True, "rows_affected": 1})
+            return results
+
+    writer = SeedWriter()
+    svc = OutboxSyncService(config=config, writers={"primary": writer})
+
+    # Run briefly — _ensure_schema + _seed_from_remote + one worker cycle
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.5)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Verify the seed query was sent
+    seed_calls = [
+        (sql, args)
+        for call in writer.calls
+        for sql, args in call
+        if "MAX(outbox_seq)" in sql
+    ]
+    assert len(seed_calls) == 1
+    assert "events" in seed_calls[0][0]
+
+    # Produce an event AFTER seeding — its seq should be > 50000
+    mw = ProducerMiddleware(db_dir=tmp_path)
+    mw._push("events", "INSERT INTO events (id) VALUES (?)", [1])
+
+    outbox = svc._target_outboxes["primary"]["events"]
+    rows = outbox.fetch_unsynced()
+    assert len(rows) == 1
+    assert rows[0].seq > 50000
+
+
+@pytest.mark.asyncio
+async def test_seed_from_remote_skips_no_inject_tables(tmp_path):
+    """_seed_from_remote does not query tables with inject_outbox_seq=False."""
+    target = TargetConfig(
+        name="audit", tables=("audit_log",), inject_outbox_seq=False,
+    )
+    config = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(target,),
+        flush_interval=0.1,
+        table_max_wait=0.1,
+    )
+
+    writer = MockWriter()
+    svc = OutboxSyncService(config=config, writers={"audit": writer})
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.3)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # No SELECT MAX(outbox_seq) should have been sent
+    for call in writer.calls:
+        for sql, _ in call:
+            assert "MAX(outbox_seq)" not in sql
+
+
+@pytest.mark.asyncio
+async def test_seed_from_remote_handles_failure_gracefully(tmp_path):
+    """_seed_from_remote continues on writer failure (non-fatal)."""
+    target = TargetConfig(name="primary", tables=("events",))
+    config = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(target,),
+        flush_interval=0.1,
+        table_max_wait=0.1,
+    )
+
+    call_count = 0
+
+    class FailSeedWriter:
+        async def write_batch(self, stmts):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                # First two calls: schema + seed — fail the seed
+                for sql, _ in stmts:
+                    if "MAX(outbox_seq)" in sql:
+                        raise ConnectionError("simulated seed failure")
+                return [{"ok": True, "rows_affected": 1} for _ in stmts]
+            return [{"ok": True, "rows_affected": 1} for _ in stmts]
+
+    svc = OutboxSyncService(
+        config=config, writers={"primary": FailSeedWriter()},
+    )
+
+    # Should not raise — seed failure is non-fatal
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.3)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

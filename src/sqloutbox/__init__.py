@@ -77,6 +77,10 @@ Modules
     sqloutbox._registry   shared_outbox() singleton registry
 """
 
+from importlib.metadata import version as _pkg_version
+
+__version__ = _pkg_version("sqloutbox")
+
 from sqloutbox._models import QueueRow
 from sqloutbox._outbox import Outbox
 from sqloutbox._registry import shared_outbox, clear_registry

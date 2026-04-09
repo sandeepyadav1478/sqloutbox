@@ -4,15 +4,18 @@ Reads local SQLite outbox files and delivers rows to N remote database targets.
 Transport is injected via the OutboxWriter protocol — sqloutbox stays
 zero-dependency (stdlib only).
 
-The service runs as a continuous loop:
-    1. Sleep ``flush_interval`` seconds
-    2. Count pending rows per table across all targets
-    3. For each target with pending rows:
-       a. fetch_unsynced()  — read pending rows per table
+The service runs as a continuous round-robin loop:
+    1. Sleep ``flush_interval`` seconds (default 1.0s — the scan interval)
+    2. For each target, iterate over its tables:
+       a. Count pending rows for this table
+       b. If pending >= ``table_flush_threshold`` (default 15) → include
+       c. Elif pending > 0 AND last flush >= ``table_max_wait`` (default 6.0s) → include
+       d. Else → skip (round-robin to next table)
+    3. For included tables:
+       a. fetch_unsynced()  — read pending rows
        b. verify_chain()    — check singly-linked chain integrity
        c. Decode payload    — tag = SQL, payload = JSON args
        d. inject_outbox_seq — append outbox_seq to INSERTs (per target config)
-       e. Collect all stmts for this target into one batch
     4. Send ONE writer.write_batch() call per target (minimise round-trips)
     5. For confirmed rows: mark_synced() + delete_synced()
     6. Every ``cleanup_every`` cycles: prune_sync_log()
@@ -47,7 +50,7 @@ from collections import defaultdict
 from typing import Any, Protocol, runtime_checkable
 
 from sqloutbox._outbox import Outbox
-from sqloutbox.config import OutboxConfig
+from sqloutbox.config import OutboxConfig, TargetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -102,21 +105,29 @@ class OutboxWriter(Protocol):
 def inject_outbox_seq(
     sql: str, args: list[Any], outbox_seq: int,
 ) -> tuple[str, list[Any]]:
-    """Append ``outbox_seq`` column to an INSERT statement.
+    """Append ``outbox_seq`` to an INSERT or UPDATE statement.
 
-    Transforms:
+    INSERT transform::
+
         INSERT INTO table (a, b) VALUES (?, ?)
-    Into:
-        INSERT OR IGNORE INTO table (a, b, outbox_seq) VALUES (?, ?, ?)
+        → INSERT OR IGNORE INTO table (a, b, outbox_seq) VALUES (?, ?, ?)
 
     The ``INSERT OR IGNORE`` prefix provides idempotent delivery — if the
     row was already written to the remote DB (e.g. after a crash between
     write and local delete), the re-attempt silently succeeds.
 
+    UPDATE transform::
+
+        UPDATE table SET a=?, b=? WHERE id=?
+        → UPDATE table SET a=?, b=?, outbox_seq=? WHERE id=?
+
+    The ``outbox_seq`` value is inserted into the args list at the correct
+    position (after SET args, before WHERE args).
+
     Parameters
     ----------
     sql:
-        The original INSERT statement.
+        The original INSERT or UPDATE statement.
     args:
         The original bind values.
     outbox_seq:
@@ -127,17 +138,38 @@ def inject_outbox_seq(
     (modified_sql, modified_args)
     """
     s = sql.strip()
-    # Convert INSERT INTO → INSERT OR IGNORE INTO
-    if s.upper().startswith("INSERT INTO"):
-        s = "INSERT OR IGNORE INTO" + s[len("INSERT INTO"):]
-    # Insert outbox_seq column before ) VALUES
-    vi = s.upper().find(") VALUES")
-    if vi != -1:
-        s = s[:vi] + ", outbox_seq" + s[vi:]
-    # Insert ? placeholder before last )
-    lp = s.rfind(")")
-    if lp != -1:
-        s = s[:lp] + ", ?" + s[lp:]
+    upper = s.upper()
+
+    if upper.startswith("INSERT"):
+        # Convert INSERT INTO → INSERT OR IGNORE INTO
+        if upper.startswith("INSERT INTO"):
+            s = "INSERT OR IGNORE INTO" + s[len("INSERT INTO"):]
+        # Insert outbox_seq column before ) VALUES
+        vi = s.upper().find(") VALUES")
+        if vi != -1:
+            s = s[:vi] + ", outbox_seq" + s[vi:]
+        # Insert ? placeholder before last )
+        lp = s.rfind(")")
+        if lp != -1:
+            s = s[:lp] + ", ?" + s[lp:]
+        return s, list(args) + [outbox_seq]
+
+    if upper.startswith("UPDATE"):
+        where_idx = upper.find(" WHERE ")
+        if where_idx != -1:
+            # Count ? placeholders in SET clause (before WHERE)
+            set_part = s[:where_idx]
+            n_set_args = set_part.count("?")
+            # Inject outbox_seq=? before WHERE
+            s = s[:where_idx] + ", outbox_seq = ?" + s[where_idx:]
+            new_args = list(args)
+            new_args.insert(n_set_args, outbox_seq)
+            return s, new_args
+        # No WHERE clause — append to SET
+        s = s + ", outbox_seq = ?"
+        return s, list(args) + [outbox_seq]
+
+    # Unknown statement type — return unchanged
     return s, list(args) + [outbox_seq]
 
 
@@ -194,46 +226,169 @@ class OutboxSyncService:
     async def run(self) -> None:
         """Run the drain worker forever. Call from an asyncio event loop."""
         logger.info(
-            "sync worker started (flush_interval=%.0fs, targets=%s)",
+            "sync worker started (poll=%.1fs, threshold=%d rows, "
+            "max_wait=%.1fs, targets=%s)",
             self._flush_interval,
+            self._config.table_flush_threshold,
+            self._config.table_max_wait,
             [t.name for t in self._config.targets],
         )
+        await self._ensure_schema()
         await self._worker_loop()
+
+    # ── Schema setup ────────────────────────────────────────────────────────
+
+    async def _ensure_schema(self) -> None:
+        """Manage ``outbox_seq`` column on remote tables at startup.
+
+        When ``config.auto_schema=True`` (default):
+
+        * Targets with ``inject_outbox_seq=True`` → ADD COLUMN outbox_seq
+        * Targets with ``inject_outbox_seq=False`` → DROP COLUMN outbox_seq
+
+        Both operations are idempotent — ADD silently skips if column exists,
+        DROP silently skips if column doesn't exist.
+
+        When ``config.auto_schema=False``: does nothing. Users manage schema
+        themselves via ``config.schema_sql()`` / ``config.drop_schema_sql()``.
+        """
+        if not self._config.auto_schema:
+            logger.info(
+                "[outbox_sync] auto_schema=False — skipping schema management. "
+                "Use config.schema_sql() / config.drop_schema_sql() for manual DDL.",
+            )
+            return
+
+        for target in self._config.targets:
+            writer = self._writers.get(target.name)
+            if not writer:
+                continue
+
+            if target.inject_outbox_seq:
+                await self._add_outbox_seq(target, writer)
+            else:
+                await self._drop_outbox_seq(target, writer)
+
+    async def _add_outbox_seq(
+        self, target: TargetConfig, writer: OutboxWriter,
+    ) -> None:
+        """ADD outbox_seq column to tables for this target."""
+        stmts: list[tuple[str, list[Any]]] = [
+            (f"ALTER TABLE {table} ADD COLUMN outbox_seq INTEGER UNIQUE", [])
+            for table in target.tables
+        ]
+        if not stmts:
+            return
+
+        logger.info(
+            "[outbox_sync] auto-schema: ADD outbox_seq to %s tables: %s",
+            target.name, list(target.tables),
+        )
+        try:
+            results = await writer.write_batch(stmts)
+            for i, result in enumerate(results):
+                table = target.tables[i]
+                if result.get("ok"):
+                    logger.info(
+                        "[outbox_sync] added outbox_seq column to %s.%s",
+                        target.name, table,
+                    )
+                else:
+                    err = result.get("error", "")
+                    if "duplic" in err.lower() or "already" in err.lower():
+                        logger.debug(
+                            "[outbox_sync] outbox_seq already exists on %s.%s",
+                            target.name, table,
+                        )
+                    else:
+                        logger.warning(
+                            "[outbox_sync] could not add outbox_seq to %s.%s: %s",
+                            target.name, table, err,
+                        )
+        except Exception as exc:
+            logger.warning(
+                "[outbox_sync] schema ADD failed for target '%s': %s",
+                target.name, exc,
+            )
+
+    async def _drop_outbox_seq(
+        self, target: TargetConfig, writer: OutboxWriter,
+    ) -> None:
+        """DROP outbox_seq column from tables for this target (cleanup)."""
+        stmts: list[tuple[str, list[Any]]] = [
+            (f"ALTER TABLE {table} DROP COLUMN outbox_seq", [])
+            for table in target.tables
+        ]
+        if not stmts:
+            return
+
+        logger.info(
+            "[outbox_sync] auto-schema: DROP outbox_seq from %s tables: %s",
+            target.name, list(target.tables),
+        )
+        try:
+            results = await writer.write_batch(stmts)
+            for i, result in enumerate(results):
+                table = target.tables[i]
+                if result.get("ok"):
+                    logger.info(
+                        "[outbox_sync] dropped outbox_seq column from %s.%s",
+                        target.name, table,
+                    )
+                else:
+                    err = result.get("error", "")
+                    # Column doesn't exist — expected if never added
+                    if "no such" in err.lower() or "does not exist" in err.lower():
+                        logger.debug(
+                            "[outbox_sync] outbox_seq not present on %s.%s — nothing to drop",
+                            target.name, table,
+                        )
+                    else:
+                        logger.warning(
+                            "[outbox_sync] could not drop outbox_seq from %s.%s: %s",
+                            target.name, table, err,
+                        )
+        except Exception as exc:
+            logger.warning(
+                "[outbox_sync] schema DROP failed for target '%s': %s",
+                target.name, exc,
+            )
 
     # ── Background worker ────────────────────────────────────────────────────
 
     async def _worker_loop(self) -> None:
-        """Drain all SQLite outbox files → ONE writer call per target per cycle."""
+        """Round-robin drain: per-table flush based on row count or time.
+
+        Each scan pass iterates over all targets and their tables.  A table
+        is included in the flush batch when *either* trigger fires:
+
+        * **Row threshold** — ``pending >= table_flush_threshold`` (default 15)
+        * **Time threshold** — any pending rows AND last flush was
+          ``>= table_max_wait`` seconds ago (default 6.0s)
+
+        Tables that don't meet either trigger are skipped (round-robin to
+        the next table).  All ready tables for one target are still batched
+        into a single ``write_batch()`` call to minimise HTTP round-trips.
+        """
+        # Per-table last-flush timestamp.  Initialised to 0.0 so every table
+        # with pending rows flushes on the very first scan.
+        last_flush: dict[str, float] = {
+            table: 0.0
+            for outboxes in self._target_outboxes.values()
+            for table in outboxes
+        }
+
+        threshold = self._config.table_flush_threshold
+        max_wait = self._config.table_max_wait
+
         while True:
             await asyncio.sleep(self._flush_interval)
             self._cycle_count += 1
             cycle_start = time.monotonic()
+            now = cycle_start
 
-            # ── Early exit: nothing pending ───────────────────────────────
-            total = 0
-            for outboxes in self._target_outboxes.values():
-                total += sum(o.pending_count() for o in outboxes.values())
-
-            if logger.isEnabledFor(_VERBOSE):
-                all_pending = {}
-                for outboxes in self._target_outboxes.values():
-                    for t, o in outboxes.items():
-                        n = o.pending_count()
-                        if n > 0:
-                            all_pending[t] = n
-                logger.log(
-                    _VERBOSE,
-                    "[outbox_sync] cycle #%d  total_pending=%d  per_table=%s",
-                    self._cycle_count, total, all_pending or "{}",
-                )
-
-            if total == 0:
-                if self._cycle_count % self._config.cleanup_every == 0:
-                    await self._prune_all()
-                continue
-
-            # ── Collect and flush per target ──────────────────────────────
             any_flushed = False
+
             for target in self._config.targets:
                 target_name = target.name
                 outboxes = self._target_outboxes.get(target_name, {})
@@ -243,15 +398,37 @@ class OutboxSyncService:
 
                 stmt_info: list[tuple[str, int]] = []   # (table, outbox_seq)
                 all_stmts: list[tuple[str, list[Any]]] = []
+                flushed_tables: list[str] = []
 
                 for table, outbox in outboxes.items():
+                    pending = outbox.pending_count()
+                    if pending == 0:
+                        continue
+
+                    elapsed = now - last_flush.get(table, 0.0)
+
+                    # ── Round-robin decision ─────────────────────────────
+                    if pending < threshold and elapsed < max_wait:
+                        if logger.isEnabledFor(_VERBOSE):
+                            logger.log(
+                                _VERBOSE,
+                                "[outbox_sync] skip table='%s'  pending=%d  "
+                                "elapsed=%.1fs  (need %d rows or %.1fs)",
+                                table, pending, elapsed, threshold, max_wait,
+                            )
+                        continue
+
+                    # ── Table is ready — fetch rows ──────────────────────
                     rows = await asyncio.to_thread(outbox.fetch_unsynced)
                     if not rows:
                         continue
 
+                    trigger = "threshold" if pending >= threshold else "max_wait"
                     logger.debug(
-                        "[outbox_sync] table='%s'  fetched=%d rows  seqs=%s",
-                        table, len(rows), [r.seq for r in rows[:10]],
+                        "[outbox_sync] table='%s'  fetched=%d rows  "
+                        "trigger=%s  seqs=%s",
+                        table, len(rows), trigger,
+                        [r.seq for r in rows[:10]],
                     )
 
                     chain_ok, gap_seqs = await asyncio.to_thread(
@@ -265,14 +442,6 @@ class OutboxSyncService:
                         )
                         continue
 
-                    if logger.isEnabledFor(_VERBOSE):
-                        logger.log(
-                            _VERBOSE,
-                            "[outbox_sync] table='%s'  chain OK  "
-                            "%d rows ready for %s",
-                            table, len(rows), target_name,
-                        )
-
                     for row in rows:
                         sql = row.tag
                         args = json.loads(row.payload.decode())
@@ -281,12 +450,7 @@ class OutboxSyncService:
                         all_stmts.append((sql, args))
                         stmt_info.append((table, row.seq))
 
-                        if logger.isEnabledFor(_VERBOSE):
-                            logger.log(
-                                _VERBOSE,
-                                "[outbox_sync]   seq=%d  sql='%s'  args=%s",
-                                row.seq, row.tag[:80], args,
-                            )
+                    flushed_tables.append(table)
 
                 if all_stmts:
                     any_flushed = True
@@ -294,11 +458,9 @@ class OutboxSyncService:
                         writer, all_stmts, stmt_info,
                         outboxes, target_name, cycle_start,
                     )
-
-            if not any_flushed:
-                if self._cycle_count % self._config.cleanup_every == 0:
-                    await self._prune_all()
-                continue
+                    # Update last-flush timestamp for included tables
+                    for table in flushed_tables:
+                        last_flush[table] = now
 
             if self._cycle_count % self._config.cleanup_every == 0:
                 await self._prune_all()

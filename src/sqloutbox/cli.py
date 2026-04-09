@@ -81,15 +81,29 @@ DB_DIR = Path(__file__).parent / "data"
 #                      Each table gets its own SQLite file: {DB_DIR}/{table}.db.
 #
 #   inject_outbox_seq  (default: True)
-#                      When True, the sync service rewrites every INSERT:
+#                      When True, the sync service appends an outbox_seq column
+#                      to every INSERT and UPDATE before sending to the remote DB:
+#
 #                        INSERT INTO t (a, b) VALUES (?, ?)
-#                      Into:
-#                        INSERT OR IGNORE INTO t (a, b, outbox_seq) VALUES (?, ?, ?)
-#                      This makes delivery idempotent — if the same row was already
-#                      written (crash between remote write and local delete), the
-#                      re-attempt silently succeeds via INSERT OR IGNORE.
-#                      Set to False for UPDATE statements or when the remote
-#                      table has no outbox_seq column.
+#                        → INSERT OR IGNORE INTO t (a, b, outbox_seq) VALUES (?, ?, ?)
+#
+#                        UPDATE t SET a=?, b=? WHERE id=?
+#                        → UPDATE t SET a=?, b=?, outbox_seq=? WHERE id=?
+#
+#                      Benefits:
+#                        • INSERT OR IGNORE = idempotent delivery (crash-safe)
+#                        • outbox_seq on remote = gap detection (no missed syncs)
+#                        • Unique per row = cross-check local vs remote
+#
+#                      When auto_schema=True (default), the sync service manages
+#                      this column automatically on startup:
+#                        inject_outbox_seq=True  → ADD COLUMN outbox_seq INTEGER UNIQUE
+#                        inject_outbox_seq=False → DROP COLUMN outbox_seq (cleanup)
+#                      Both are idempotent — safe on every restart.
+#
+#                      Prefer manual migrations (Alembic, Django, etc.)?
+#                      Set auto_schema=False and use config.schema_sql() /
+#                      config.drop_schema_sql() to generate the DDL yourself.
 
 ANALYTICS_DB_URL   = os.environ.get("ANALYTICS_DB_URL", "")
 ANALYTICS_DB_TOKEN = os.environ.get("ANALYTICS_DB_TOKEN", "")
@@ -134,8 +148,22 @@ _ANALYTICS = TargetConfig(
 #                    reduce round-trips but increase memory and remote batch
 #                    size. Default: 500.
 #
-#   flush_interval   Seconds between drain cycles. Lower = less delivery lag,
-#                    more CPU. Default: 15.0.
+#   flush_interval   Seconds between round-robin scan passes. Default: 1.0.
+#
+#   table_flush_threshold
+#                    Min pending rows to trigger immediate flush per table.
+#                    Default: 15.
+#
+#   table_max_wait   Max seconds a table can have any pending rows before
+#                    flush — even below the threshold. Default: 6.0.
+#
+#   auto_schema      When True (default), the sync service auto-manages the
+#                    outbox_seq column on remote tables at startup:
+#                      inject_outbox_seq=True  → ADD COLUMN
+#                      inject_outbox_seq=False → DROP COLUMN (cleanup)
+#                    Set to False if you manage schema via migration tools
+#                    (Alembic, Django, etc.). Use config.schema_sql() and
+#                    config.drop_schema_sql() to generate DDL yourself.
 #
 #   cleanup_every    Run prune_sync_log() every N cycles to trim the audit
 #                    trail (outbox_sync_log table in each SQLite file).
@@ -154,7 +182,11 @@ config = OutboxConfig(
         # _BILLING,             # ← uncomment for multi-DB
     ),
     batch_size=500,
-    flush_interval=15.0,
+    # Round-robin drain: scan every 1s, flush when 15+ rows OR 6s elapsed
+    # flush_interval=1.0,       # scan interval (default: 1.0s)
+    # table_flush_threshold=15, # row count trigger (default: 15)
+    # table_max_wait=6.0,       # time trigger (default: 6.0s)
+    # auto_schema=True,         # auto ADD/DROP outbox_seq on remote tables
     cleanup_every=500,
     retain_log_days=7,
 )
@@ -347,10 +379,12 @@ async def _run() -> None:
     svc = OutboxSyncService(config=config, writers=writers)
 
     logger.info(
-        "started  db_dir=%s  targets=%s  flush_interval=%.0fs",
+        "started  db_dir=%s  targets=%s  poll=%.1fs  threshold=%d  max_wait=%.1fs",
         config.db_dir,
         [t.name for t in config.targets],
         config.flush_interval,
+        config.table_flush_threshold,
+        config.table_max_wait,
     )
     await svc.run()
 
@@ -440,6 +474,14 @@ def cmd_init(config_dir: Path) -> None:
     print(f"Next steps:")
     print(f"  1. Edit {config_dir}/outbox_config.py — define your targets and writers")
     print(f"  2. Run:  python {config_dir}/run_service.py")
+    print()
+    print(f"  Schema management (auto_schema=True by default):")
+    print(f"    inject_outbox_seq=True  → auto ADD outbox_seq column on startup")
+    print(f"    inject_outbox_seq=False → auto DROP outbox_seq column (cleanup)")
+    print(f"  Using migration tools? Set auto_schema=False and run DDL yourself:")
+    print(f"       python -c \"from outbox_config import config; print('\\n'.join(config.schema_sql()))\"")
+    print(f"       python -c \"from outbox_config import config; print('\\n'.join(config.drop_schema_sql()))\"")
+
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────

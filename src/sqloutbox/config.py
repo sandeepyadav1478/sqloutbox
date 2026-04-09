@@ -13,9 +13,13 @@ Example
             TargetConfig(name="analytics", tables=("events", "metrics")),
             TargetConfig(name="audit", tables=("audit_log",), inject_outbox_seq=False),
         ),
-        batch_size=500,
-        flush_interval=15.0,
     )
+
+    # Generate ALTER TABLE DDL for remote tables that need outbox_seq:
+    for stmt in config.schema_sql():
+        print(stmt)
+    # → ALTER TABLE events ADD COLUMN outbox_seq INTEGER UNIQUE
+    # → ALTER TABLE metrics ADD COLUMN outbox_seq INTEGER UNIQUE
 """
 
 from __future__ import annotations
@@ -40,10 +44,19 @@ class TargetConfig:
 
     inject_outbox_seq:
         When True (default), the sync service appends an ``outbox_seq`` column
-        to every INSERT statement before sending it to the remote DB. This
-        provides deduplication on the remote side (INSERT OR IGNORE).
-        Set to False for UPDATE statements or when the remote schema has no
-        ``outbox_seq`` column.
+        to every INSERT and UPDATE statement before sending it to the remote DB.
+
+        For INSERTs: rewrites to ``INSERT OR IGNORE INTO ... (cols, outbox_seq)``
+        providing idempotent delivery — duplicate re-attempts silently succeed.
+
+        For UPDATEs: appends ``outbox_seq = ?`` to the SET clause so the remote
+        row records which outbox sequence wrote it.
+
+        The remote table must have ``outbox_seq INTEGER UNIQUE`` (NULLs allowed
+        so direct queries that bypass the outbox still work). Use
+        ``OutboxConfig.schema_sql()`` to generate the ALTER TABLE DDL.
+
+        Set to False when the remote schema has no ``outbox_seq`` column.
     """
     name: str
     tables: tuple[str, ...]
@@ -70,7 +83,27 @@ class OutboxConfig:
         Maximum rows fetched per table per sync cycle. Default: 500.
 
     flush_interval:
-        Seconds between sync cycles. Default: 15.0.
+        Seconds between round-robin scan passes. Default: 1.0.
+
+    table_flush_threshold:
+        Minimum pending rows to trigger an immediate flush for a table,
+        regardless of how recently it was last flushed. Default: 15.
+
+    table_max_wait:
+        Maximum seconds a table can have *any* pending rows before it is
+        included in the next flush — even if the row count is below
+        ``table_flush_threshold``. Default: 6.0.
+
+    auto_schema:
+        When True (default), the sync service automatically manages the
+        ``outbox_seq`` column on remote tables at startup:
+
+        * ``inject_outbox_seq=True``  → ADD COLUMN (if not exists)
+        * ``inject_outbox_seq=False`` → DROP COLUMN (cleanup, if exists)
+
+        Set to False if you manage schema via migration tools (Alembic,
+        Django migrations, etc.) and want full control. Use ``schema_sql()``
+        and ``drop_schema_sql()`` to generate the DDL yourself.
 
     cleanup_every:
         Run ``prune_sync_log()`` every N sync cycles. Default: 500.
@@ -81,7 +114,10 @@ class OutboxConfig:
     db_dir: Path
     targets: tuple[TargetConfig, ...] = ()
     batch_size: int = 500
-    flush_interval: float = 15.0
+    flush_interval: float = 1.0
+    table_flush_threshold: int = 15
+    table_max_wait: float = 6.0
+    auto_schema: bool = True
     cleanup_every: int = 500
     retain_log_days: int = 7
 
@@ -105,3 +141,48 @@ class OutboxConfig:
         for t in self.targets:
             result.extend(t.tables)
         return tuple(result)
+
+    def schema_sql(self) -> list[str]:
+        """Return ALTER TABLE DDL to add ``outbox_seq`` to remote tables.
+
+        Only includes tables where ``inject_outbox_seq=True``.  Run these
+        statements on your remote database before starting the sync service.
+
+        The column is ``INTEGER UNIQUE`` — unique for dedup / gap detection,
+        but NULLable so direct queries that bypass the outbox still work.
+
+        Example::
+
+            for stmt in config.schema_sql():
+                await db.execute(stmt)
+        """
+        stmts: list[str] = []
+        for target in self.targets:
+            if target.inject_outbox_seq:
+                for table in target.tables:
+                    stmts.append(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN outbox_seq INTEGER UNIQUE"
+                    )
+        return stmts
+
+    def drop_schema_sql(self) -> list[str]:
+        """Return ALTER TABLE DDL to remove ``outbox_seq`` from remote tables.
+
+        Only includes tables where ``inject_outbox_seq=False``.  Useful for
+        cleanup when disabling the outbox_seq verification feature.
+
+        Example::
+
+            for stmt in config.drop_schema_sql():
+                await db.execute(stmt)
+        """
+        stmts: list[str] = []
+        for target in self.targets:
+            if not target.inject_outbox_seq:
+                for table in target.tables:
+                    stmts.append(
+                        f"ALTER TABLE {table} "
+                        f"DROP COLUMN outbox_seq"
+                    )
+        return stmts

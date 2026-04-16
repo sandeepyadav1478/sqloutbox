@@ -513,26 +513,51 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
     # Print report
     print()
     print("sqloutbox verify — integrity scan")
+    if result.checked_at:
+        print(f"  checked at {result.checked_at}")
     print("-" * 70)
     for t in result.tables:
         chain_str = "ok" if t.chain_ok else f"GAPS{list(t.chain_gaps)}"
         seq_str = "ok" if t.seq_continuous else "GAPS"
         ts_str = "ok" if t.timestamps_monotonic else "DRIFT"
         status = "OK" if t.ok else "FAIL"
+
+        # Seq range display
+        if t.seq_range:
+            seq_info = f"seq {t.seq_range[0]}..{t.seq_range[1]}"
+        else:
+            seq_info = "seq (empty)"
+
+        # Synced count (delivered rows)
+        synced = t.sync_log_rows
+
         print(
             f"  {t.table:<30s}  {status:<4s}  "
-            f"pending={t.pending_count}  rows={t.total_rows}  "
+            f"pending={t.pending_count}  synced={synced}  "
+            f"total={t.total_rows}  {seq_info}"
+        )
+        print(
+            f"  {'':<30s}        "
             f"chain={chain_str}  seq={seq_str}  ts={ts_str}"
+            + (f"  orphan_sync={t.orphan_sync_log}" if t.orphan_sync_log else "")
         )
         if t.errors:
             for err in t.errors:
                 print(f"    ! {err}")
+        print()
     print("-" * 70)
     passed = sum(1 for t in result.tables if t.ok)
     total = len(result.tables)
+    total_synced = sum(t.sync_log_rows for t in result.tables)
+    total_pending = sum(t.pending_count for t in result.tables)
+    total_rows = sum(t.total_rows for t in result.tables)
     print(
         f"  Result: {passed}/{total} passed  "
         f"duration={result.duration_ms:.0f}ms"
+    )
+    print(
+        f"  Totals: {total_rows} rows  "
+        f"{total_synced} synced  {total_pending} pending"
     )
     if not result.ok:
         failed = [t.table for t in result.tables if not t.ok]

@@ -396,6 +396,19 @@ class Outbox:
         )
         return True
 
+    # ── Verification ───────────────────────────────────────────────────────
+
+    def verify_full(self) -> TableVerifyResult:
+        """Run a comprehensive integrity check on this outbox.
+
+        Checks chain integrity, sequence continuity, timestamp monotonicity,
+        orphan sync_log entries, and row counts. All read-only — no writes.
+
+        Returns a :class:`TableVerifyResult` with ``ok=True`` if all checks pass.
+        """
+        from sqloutbox._verify import TableVerifyResult, verify_outbox
+        return verify_outbox(self)
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _seq_accounted(self, conn: sqlite3.Connection, seq: int) -> bool:

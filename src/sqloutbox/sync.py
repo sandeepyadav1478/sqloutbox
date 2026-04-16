@@ -50,6 +50,7 @@ from collections import defaultdict
 from typing import Any, Protocol, runtime_checkable
 
 from sqloutbox._outbox import Outbox
+from sqloutbox._verify import VerifyResult, verify_all
 from sqloutbox.config import OutboxConfig, TargetConfig
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,12 @@ class OutboxSyncService:
         self._flush_interval = config.flush_interval
         self._cycle_count = 0
 
+        # Verification support — request_verify() sets the event,
+        # worker loop checks it between drain cycles.
+        self._verify_requested = asyncio.Event()
+        self._verify_result: VerifyResult | None = None
+        self._verify_done = asyncio.Event()
+
         # Create per-target per-table Outbox instances from config.
         # Each target may have its own db_dir (set by TOML loader for
         # per-app isolation) or fall back to config.db_dir.
@@ -229,6 +236,32 @@ class OutboxSyncService:
                 )
                 for table in target.tables
             }
+
+    # ── Verification ────────────────────────────────────────────────────────
+
+    async def request_verify(self) -> VerifyResult:
+        """Request a full integrity scan of all outbox databases.
+
+        The scan runs between drain cycles — the current cycle finishes
+        first, then verification runs, then normal drain resumes.
+
+        This method blocks until the scan is complete and returns the
+        result.  Safe to call from any coroutine in the same event loop.
+        """
+        self._verify_result = None
+        self._verify_done.clear()
+        self._verify_requested.set()
+        await self._verify_done.wait()
+        assert self._verify_result is not None
+        return self._verify_result
+
+    def _run_verify(self) -> VerifyResult:
+        """Collect all outboxes and run verify_all(). Called in a thread."""
+        all_outboxes: dict[str, Outbox] = {}
+        for target_name, outboxes in self._target_outboxes.items():
+            for table, outbox in outboxes.items():
+                all_outboxes[f"{target_name}.{table}"] = outbox
+        return verify_all(all_outboxes)
 
     # ── Entry point ──────────────────────────────────────────────────────────
 
@@ -494,6 +527,24 @@ class OutboxSyncService:
 
         while True:
             await asyncio.sleep(self._flush_interval)
+
+            # ── Verification hook ───────────────────────────────────
+            # Runs between drain cycles — current cycle already finished,
+            # next cycle starts after verification completes.
+            if self._verify_requested.is_set():
+                self._verify_requested.clear()
+                logger.info("[outbox_sync] integrity verification requested")
+                result = await asyncio.to_thread(self._run_verify)
+                self._verify_result = result
+                self._verify_done.set()
+                status = "OK" if result.ok else "FAILED"
+                logger.info(
+                    "[outbox_sync] verification complete: %s  "
+                    "tables=%d  duration=%.0fms",
+                    status, len(result.tables), result.duration_ms,
+                )
+                continue  # skip this drain cycle, resume next iteration
+
             self._cycle_count += 1
             cycle_start = time.monotonic()
             now = cycle_start

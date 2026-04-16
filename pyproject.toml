@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqloutbox"
-version = "0.3.0"
+version = "0.4.0"
 description = "Config-driven SQLite transactional outbox — multi-app TOML config, per-table injection control, .env/Doppler credential loading, multi-target sync daemon"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -453,6 +453,95 @@ def cmd_runservice(config_path: Path | None) -> None:
         pass
 
 
+# ── verify command ──────────────────────────────────────────────────────────
+
+
+def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
+    """Run offline integrity verification on outbox ``.db`` files.
+
+    Two modes:
+
+    1. ``--config outbox.toml`` — discover ``.db`` files from TOML config
+    2. ``--db-dir /path/to/data`` — scan directory for ``*.db`` files
+
+    Prints a structured report and exits with code 0 (all OK) or 1 (failures).
+    """
+    from sqloutbox._outbox import Outbox
+    from sqloutbox._verify import verify_all
+
+    outboxes: dict[str, Outbox] = {}
+
+    if config_path is not None:
+        from sqloutbox._runner import load_config_toml
+        config, _writers = load_config_toml(config_path)
+        for target in config.targets:
+            db_dir = target.db_dir or config.db_dir
+            for table in target.tables:
+                db_path = db_dir / f"{table}.db"
+                if db_path.exists():
+                    outboxes[f"{target.name}.{table}"] = Outbox(
+                        db_path=db_path, namespace=table,
+                    )
+                else:
+                    print(f"  skip {table}.db — file not found at {db_path}")
+
+    elif db_dir_path is not None:
+        if not db_dir_path.is_dir():
+            print(f"error: not a directory: {db_dir_path}", file=sys.stderr)
+            sys.exit(1)
+        for db_file in sorted(db_dir_path.glob("*.db")):
+            name = db_file.stem
+            outboxes[name] = Outbox(db_path=db_file, namespace=name)
+
+    else:
+        print(
+            "error: provide --config <file.toml> or --db-dir <path>\n\n"
+            "Usage:\n"
+            "  sqloutbox verify --config outbox.toml\n"
+            "  sqloutbox verify --db-dir /path/to/data",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not outboxes:
+        print("no .db files found — nothing to verify")
+        sys.exit(0)
+
+    # Run verification
+    result = verify_all(outboxes)
+
+    # Print report
+    print()
+    print("sqloutbox verify — integrity scan")
+    print("-" * 70)
+    for t in result.tables:
+        chain_str = "ok" if t.chain_ok else f"GAPS{list(t.chain_gaps)}"
+        seq_str = "ok" if t.seq_continuous else "GAPS"
+        ts_str = "ok" if t.timestamps_monotonic else "DRIFT"
+        status = "OK" if t.ok else "FAIL"
+        print(
+            f"  {t.table:<30s}  {status:<4s}  "
+            f"pending={t.pending_count}  rows={t.total_rows}  "
+            f"chain={chain_str}  seq={seq_str}  ts={ts_str}"
+        )
+        if t.errors:
+            for err in t.errors:
+                print(f"    ! {err}")
+    print("-" * 70)
+    passed = sum(1 for t in result.tables if t.ok)
+    total = len(result.tables)
+    print(
+        f"  Result: {passed}/{total} passed  "
+        f"duration={result.duration_ms:.0f}ms"
+    )
+    if not result.ok:
+        failed = [t.table for t in result.tables if not t.ok]
+        print(f"  Failed: {', '.join(failed)}")
+    print()
+
+    sys.exit(0 if result.ok else 1)
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
@@ -477,6 +566,19 @@ def main(argv: list[str] | None = None) -> None:
         help="TOML config file (default: ./outbox.toml)",
     )
 
+    p_verify = sub.add_parser(
+        "verify",
+        help="run integrity verification on outbox .db files",
+    )
+    p_verify.add_argument(
+        "--config", "-c", type=Path, default=None, dest="verify_config",
+        help="TOML config file (discover .db files from targets)",
+    )
+    p_verify.add_argument(
+        "--db-dir", "-d", type=Path, default=None,
+        help="directory to scan for *.db files",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -487,3 +589,5 @@ def main(argv: list[str] | None = None) -> None:
         cmd_init(Path(args.dir))
     elif args.command == "runservice":
         cmd_runservice(args.config)
+    elif args.command == "verify":
+        cmd_verify(args.verify_config, args.db_dir)

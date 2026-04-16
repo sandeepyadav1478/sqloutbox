@@ -542,12 +542,17 @@ def load_config_toml(
 # ── Service runner ───────────────────────────────────────────────────────────
 
 
-async def _run_service(config_path: Path) -> None:
-    """Load config and run the OutboxSyncService forever."""
+async def run_service_main(config_path: Path) -> None:
+    """Entry point with signal handling.  Runs until SIGTERM / SIGINT.
+
+    Signal handlers:
+        SIGTERM / SIGINT — graceful shutdown (finish current cycle, then stop)
+        SIGUSR1 — trigger integrity verification between drain cycles
+                  (result logged at INFO level; not available on Windows)
+    """
     from sqloutbox.sync import OutboxSyncService
 
     config, writers = load_config_toml(config_path)
-
     svc = OutboxSyncService(config=config, writers=writers)
 
     logger.info(
@@ -563,11 +568,7 @@ async def _run_service(config_path: Path) -> None:
             "  target '%s'  db_dir=%s  batch=%d  .db files: %s",
             target.name, db_dir, target.batch_size, db_files,
         )
-    await svc.run()
 
-
-async def run_service_main(config_path: Path) -> None:
-    """Entry point with signal handling.  Runs until SIGTERM / SIGINT."""
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
 
@@ -578,7 +579,16 @@ async def run_service_main(config_path: Path) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _on_signal)
 
-    task = loop.create_task(_run_service(config_path), name="sqloutbox.drain")
+    # SIGUSR1 triggers integrity verification (Unix only)
+    if hasattr(signal, "SIGUSR1"):
+        def _on_verify(*_: object) -> None:
+            logger.info("SIGUSR1 received — requesting integrity verification")
+            # Fire-and-forget: set the event, worker loop picks it up
+            svc._verify_requested.set()
+
+        loop.add_signal_handler(signal.SIGUSR1, _on_verify)
+
+    task = loop.create_task(svc.run(), name="sqloutbox.drain")
     await stop.wait()
     task.cancel()
     try:

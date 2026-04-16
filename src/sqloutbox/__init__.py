@@ -66,6 +66,7 @@ from sqloutbox.config import OutboxConfig, TargetConfig
 from sqloutbox.middleware import SQLMiddleware
 from sqloutbox.sync import OutboxSyncService, OutboxWriter, inject_outbox_seq
 from sqloutbox._runner import load_config_toml
+from sqloutbox._verify import TableVerifyResult, VerifyResult, verify_all, verify_outbox
 
 __all__ = [
     # Core queue
@@ -84,4 +85,9 @@ __all__ = [
     "OutboxSyncService",
     "OutboxWriter",
     "inject_outbox_seq",
+    # Verification
+    "TableVerifyResult",
+    "VerifyResult",
+    "verify_outbox",
+    "verify_all",
 ]

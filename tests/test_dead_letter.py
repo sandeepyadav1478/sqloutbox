@@ -247,3 +247,156 @@ def test_classify_unknown():
     assert classify_write_error("") == "UNKNOWN"
     assert classify_write_error("some wholly unrecognised message") == "UNKNOWN"
     assert classify_write_error(None) == "UNKNOWN"
+
+
+import asyncio
+
+import pytest
+
+from sqloutbox.config import OutboxConfig, TargetConfig
+from sqloutbox.sync import OutboxSyncService
+
+
+def _service(tmp_path, writer, *, tables=("evt",), max_attempts=10):
+    # auto_schema=False + inject_outbox_seq=False so startup _ensure_schema()/
+    # _seed_from_remote() do NOT call write_batch() and pollute writer.seen.
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(TargetConfig(name="primary", tables=tables,
+                              inject_outbox_seq=False),),
+        flush_interval=0.01,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        auto_schema=False,
+        max_attempts=max_attempts,
+    )
+    return OutboxSyncService(config=cfg, writers={"primary": writer}), cfg
+
+
+class _SeqWriter:
+    """Writer whose ok/err verdict per stmt is driven by an index→verdict map.
+
+    Verdict is matched on the position of the stmt within the batch it receives.
+    """
+    def __init__(self, verdicts):
+        # verdicts: list of dicts, applied in order to each call's stmts.
+        self.verdicts = verdicts
+        self.seen = []
+
+    async def write_batch(self, stmts):
+        self.seen.extend(stmts)
+        return [self.verdicts[i] for i in range(len(stmts))]
+
+
+@pytest.mark.asyncio
+async def test_head_hold_no_leapfrog(tmp_path: Path):
+    """Head fails, a later row in the same namespace must NOT be confirmed."""
+    # Writer: first stmt fails (TRANSIENT), second would succeed.
+    writer = _SeqWriter([
+        {"ok": False, "error": "connection reset"},
+        {"ok": True, "rows_affected": 1},
+    ])
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    s2 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+
+    # Drive ONE flush directly (deterministic — no loop timing).
+    stmts = [("INSERT INTO evt (a) VALUES (?)", [1]),
+             ("INSERT INTO evt (a) VALUES (?)", [2])]
+    stmt_info = [("evt", s1), ("evt", s2)]
+    await svc._flush_to_target(
+        writer, stmts, stmt_info,
+        svc._target_outboxes["primary"], "primary", 0.0,
+    )
+
+    # NEITHER row confirmed: s1 failed (held), s2 must not leapfrog it.
+    assert ob.pending_count() == 2
+    # The head recorded one failed attempt; the successor recorded none.
+    head = ob.peek_head()
+    assert head.seq == s1 and head.attempts == 1
+    assert head.last_error_class == "TRANSIENT"
+
+
+@pytest.mark.asyncio
+async def test_head_success_advances(tmp_path: Path):
+    """Head succeeds → confirmed + deleted; successor becomes the new head."""
+    writer = _SeqWriter([
+        {"ok": True, "rows_affected": 1},
+        {"ok": True, "rows_affected": 1},
+    ])
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    s2 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+
+    await svc._flush_to_target(
+        writer,
+        [("INSERT INTO evt (a) VALUES (?)", [1]),
+         ("INSERT INTO evt (a) VALUES (?)", [2])],
+        [("evt", s1), ("evt", s2)],
+        svc._target_outboxes["primary"], "primary", 0.0,
+    )
+    assert ob.pending_count() == 0  # both delivered in order
+
+
+@pytest.mark.asyncio
+async def test_auto_dead_letter_at_max_attempts(tmp_path: Path):
+    """Head at attempts==max_attempts-1 fails once more → dead-lettered; ns unblocks."""
+    writer = _SeqWriter([{"ok": False, "error": "no such column: x"}])
+    svc, cfg = _service(tmp_path, writer, max_attempts=3)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    # Pre-seed two prior failures (attempts=2). This flush is the 3rd → hits cap.
+    ob.record_attempt(s1, error="x", error_class="DETERMINISTIC")
+    ob.record_attempt(s1, error="x", error_class="DETERMINISTIC")
+
+    await svc._flush_to_target(
+        writer, [("INSERT INTO evt (a) VALUES (?)", [1])],
+        [("evt", s1)],
+        svc._target_outboxes["primary"], "primary", 0.0,
+    )
+
+    # Moved to dead_log, queue empty, namespace unblocked.
+    assert ob.pending_count() == 0
+    dead = ob.list_dead()
+    assert len(dead) == 1 and dead[0].seq == s1
+    assert dead[0].reason == "max_attempts"
+    assert dead[0].attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_max_attempts_none_plateaus_forever(tmp_path: Path):
+    """max_attempts=None never auto-dead-letters; the head just keeps holding."""
+    writer = _SeqWriter([{"ok": False, "error": "no such column: x"}])
+    svc, cfg = _service(tmp_path, writer, max_attempts=None)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    for _ in range(20):
+        await svc._flush_to_target(
+            writer, [("INSERT INTO evt (a) VALUES (?)", [1])],
+            [("evt", s1)],
+            svc._target_outboxes["primary"], "primary", 0.0,
+        )
+    # Still in the queue, never dead-lettered.
+    assert ob.pending_count() == 1
+    assert ob.list_dead() == []
+    assert ob.peek_head().attempts == 20
+
+
+@pytest.mark.asyncio
+async def test_already_applied_advances_head(tmp_path: Path):
+    """A UNIQUE-collision result advances the head (data present = success)."""
+    writer = _SeqWriter([{"ok": False, "error": "UNIQUE constraint failed: evt.outbox_seq"}])
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+
+    await svc._flush_to_target(
+        writer, [("INSERT INTO evt (a) VALUES (?)", [1])],
+        [("evt", s1)],
+        svc._target_outboxes["primary"], "primary", 0.0,
+    )
+    # Head advanced (treated as delivered); nothing dead-lettered.
+    assert ob.pending_count() == 0
+    assert ob.list_dead() == []

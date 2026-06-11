@@ -803,7 +803,17 @@ class OutboxSyncService:
         target_name: str,
         cycle_start: float,
     ) -> None:
-        """Send a batch of statements to a target and confirm delivery."""
+        """Send a batch and confirm delivery HEAD-FIRST per namespace.
+
+        WS-1 head-of-line hold: rows are grouped by namespace and confirmed in
+        seq order. Confirmation STOPS at the first non-ok row in a namespace —
+        later rows do NOT leapfrog a failed predecessor. The failed head is
+        classified (§3.3), its attempt recorded (§3.1), and:
+          * ALREADY_APPLIED → treated as delivered (advance the head).
+          * else, max_attempts hit → dead-lettered reason='max_attempts' (D1),
+            namespace unblocks.
+          * else → held; the §3.2 backoff gate (in _worker_loop) defers its retry.
+        """
         logger.debug(
             "[outbox_sync] cycle #%d  sending %d rows across %d tables to %s",
             self._cycle_count, len(stmts),
@@ -823,47 +833,99 @@ class OutboxSyncService:
             return
         write_ms = (time.monotonic() - t_write) * 1000
 
-        confirmed_by_table: dict[str, list[int]] = defaultdict(list)
-        failed_count = 0
+        # Group (result, seq) by namespace, preserving the batch order (which is
+        # seq order — _worker_loop fetched ORDER BY seq).
+        by_table: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         for i, result in enumerate(results):
             table, outbox_seq = stmt_info[i]
-            if result["ok"]:
-                confirmed_by_table[table].append(outbox_seq)
-            else:
-                failed_count += 1
-                logger.warning(
-                    "[outbox_sync] %s write failed for '%s' seq=%d: %s",
-                    target_name, table, outbox_seq, result.get("error", ""),
-                )
+            by_table[table].append((outbox_seq, result))
 
+        max_attempts = self._config.max_attempts
         total_confirmed = 0
-        for table, seqs in confirmed_by_table.items():
+        total_failed = 0
+        total_dead = 0
+
+        for table, items in by_table.items():
             outbox = outboxes[table]
-            await asyncio.to_thread(outbox.mark_synced, seqs)
-            await asyncio.to_thread(outbox.delete_synced, seqs)
-            total_confirmed += len(seqs)
-            if logger.isEnabledFor(_VERBOSE):
-                logger.log(
-                    _VERBOSE,
-                    "[outbox_sync]   confirmed %s table='%s'  %d rows  "
-                    "seqs=%s",
-                    target_name, table, len(seqs), seqs[:10],
+            confirmed: list[int] = []
+            # Walk this namespace's rows in seq order; stop at the first hold.
+            for seq, result in items:
+                if result.get("ok"):
+                    confirmed.append(seq)
+                    continue
+
+                # First non-ok row → classify and decide head's fate.
+                err = result.get("error", "") or ""
+                err_class = classify_write_error(err)
+
+                if err_class == "ALREADY_APPLIED":
+                    # The row's key already exists at the destination — success.
+                    # Confirm it and keep walking (it does NOT block successors).
+                    confirmed.append(seq)
+                    logger.info(
+                        "[outbox_sync] %s '%s' seq=%d already applied — advancing",
+                        target_name, table, seq,
+                    )
+                    continue
+
+                # A genuine failure: HOLD. Record the attempt, then either
+                # dead-letter (cap hit) or stop confirming this namespace.
+                await asyncio.to_thread(
+                    outbox.record_attempt, seq, err, err_class,
                 )
+                attempts_now = (
+                    outbox.peek_head().attempts
+                    if outbox.peek_head() is not None else 0
+                )
+                if max_attempts is not None and attempts_now >= max_attempts:
+                    moved = await asyncio.to_thread(
+                        outbox.dead_letter, seq, "max_attempts",
+                    )
+                    if moved:
+                        total_dead += 1
+                        logger.warning(
+                            "[outbox_sync] dead-lettered ns=%s seq=%s after %d "
+                            "attempts: %s",
+                            table, seq, attempts_now, err,
+                        )
+                    # Namespace unblocks — but we deliberately do NOT continue
+                    # confirming rows that were sent AFTER this one in the same
+                    # batch: they were fetched assuming this head; let the next
+                    # cycle re-fetch from the (now advanced) head in clean order.
+                    total_failed += 1
+                    break
+                else:
+                    logger.warning(
+                        "[outbox_sync] %s '%s' seq=%d held (attempt %d, class=%s): %s",
+                        target_name, table, seq, attempts_now, err_class, err,
+                    )
+                    total_failed += 1
+                    break
+
+            if confirmed:
+                await asyncio.to_thread(outbox.mark_synced, confirmed)
+                await asyncio.to_thread(outbox.delete_synced, confirmed)
+                total_confirmed += len(confirmed)
+                if logger.isEnabledFor(_VERBOSE):
+                    logger.log(
+                        _VERBOSE,
+                        "[outbox_sync]   confirmed %s table='%s'  %d rows  seqs=%s",
+                        target_name, table, len(confirmed), confirmed[:10],
+                    )
 
         cycle_ms = (time.monotonic() - cycle_start) * 1000
-        if total_confirmed:
+        if total_confirmed or total_failed or total_dead:
             level = (
                 logging.INFO
-                if (total_confirmed >= 10 or failed_count)
+                if (total_confirmed >= 10 or total_failed or total_dead)
                 else logging.DEBUG
             )
             logger.log(
                 level,
-                "[outbox_sync] cycle #%d  %s delivered=%d  failed=%d  "
+                "[outbox_sync] cycle #%d  %s delivered=%d  held=%d  dead=%d  "
                 "tables=%s  write=%.0fms  cycle=%.0fms",
-                self._cycle_count, target_name, total_confirmed, failed_count,
-                list(confirmed_by_table.keys()),
-                write_ms, cycle_ms,
+                self._cycle_count, target_name, total_confirmed, total_failed,
+                total_dead, list(by_table.keys()), write_ms, cycle_ms,
             )
 
     # ── Maintenance ──────────────────────────────────────────────────────────

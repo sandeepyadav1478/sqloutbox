@@ -84,9 +84,72 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl  # Unix-only (macOS + Ubuntu are the supported platforms)
+except ImportError:  # pragma: no cover — Windows / non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
 logger = logging.getLogger("sqloutbox.runner")
 
 DEFAULT_CONFIG_FILE = "outbox.toml"
+
+# Advisory single-drain lock. Held for the process lifetime so exactly one
+# `sqloutbox runservice` drains a given db_dir. Producers (enqueue) never take
+# this lock — only the drain service. Prevents double-delivery from an
+# accidental double-start, blue-green overlap, or k8s maxSurge>0.
+LOCK_FILENAME = ".sqloutbox.lock"
+
+
+def acquire_single_drain_lock(db_dir: Path):
+    """Acquire an exclusive, non-blocking advisory lock on ``<db_dir>/.sqloutbox.lock``.
+
+    Returns the open file handle (KEEP it for the process lifetime — closing it
+    releases the lock). If another drain already holds the lock, logs a clear
+    message and raises ``SystemExit(1)``.
+
+    On non-POSIX platforms (no ``fcntl``) this is a no-op that returns ``None``
+    and WARNs once — single-drain enforcement is unavailable there.
+    """
+    db_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = db_dir / LOCK_FILENAME
+
+    if fcntl is None:  # pragma: no cover — Windows / non-POSIX
+        logger.warning(
+            "fcntl unavailable on this platform — single-drain lock NOT enforced "
+            "for %s. Ensure exactly one drain runs per db_dir by other means.",
+            db_dir,
+        )
+        return None
+
+    # Open (or create) the lock file and keep the handle open. flock is tied to
+    # the open file description, so the handle must outlive this function.
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        logger.critical(
+            "another drain is already running on %s "
+            "(lock held: %s) — refusing to start a second drain",
+            db_dir, lock_path,
+        )
+        raise SystemExit(1)
+    logger.info("acquired single-drain lock: %s", lock_path)
+    return handle
+
+
+def release_single_drain_lock(handle) -> None:
+    """Release the single-drain lock by closing its file handle (no-op if None)."""
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
 
@@ -542,19 +605,14 @@ def load_config_toml(
 # ── Service runner ───────────────────────────────────────────────────────────
 
 
-async def run_service_main(config_path: Path) -> None:
-    """Entry point with signal handling.  Runs until SIGTERM / SIGINT.
+async def _run_service_body(
+    config_path: Path, config: Any, svc: Any,
+) -> None:
+    """Banner + signal handlers + observe-the-drain-task loop (WS-0 shape).
 
-    Signal handlers:
-        SIGTERM / SIGINT — graceful shutdown (finish current cycle, then stop)
-        SIGUSR1 — trigger integrity verification between drain cycles
-                  (result logged at INFO level; not available on Windows)
+    Split out of run_service_main so the single-drain lock (WS-4) can wrap the
+    whole run in try/finally without re-indenting the WS-0 task-watch logic.
     """
-    from sqloutbox.sync import OutboxSyncService
-
-    config, writers = load_config_toml(config_path)
-    svc = OutboxSyncService(config=config, writers=writers)
-
     logger.info(
         "config=%s  poll=%.1fs  threshold=%d  max_wait=%.1fs",
         config_path,
@@ -583,7 +641,6 @@ async def run_service_main(config_path: Path) -> None:
     if hasattr(signal, "SIGUSR1"):
         def _on_verify(*_: object) -> None:
             logger.info("SIGUSR1 received — requesting integrity verification")
-            # Fire-and-forget: set the event, worker loop picks it up
             svc._verify_requested.set()
 
         loop.add_signal_handler(signal.SIGUSR1, _on_verify)
@@ -596,19 +653,51 @@ async def run_service_main(config_path: Path) -> None:
     )
 
     if task in done:
-        # The drain exited on its own — this is always a fault (the worker loop
-        # is an infinite loop; it only returns/raises on error). Surface it
-        # LOUDLY so a supervisor (systemd Restart=on-failure) restarts us,
-        # instead of lingering as a zombie with a dead worker.
+        # The drain exited on its own — always a fault (the worker loop is
+        # infinite; it only returns/raises on error). Surface it LOUDLY so a
+        # supervisor restarts us instead of lingering as a zombie.
         stop_task.cancel()
         exc = task.exception()
         logger.critical("drain worker exited unexpectedly: %r", exc)
         raise SystemExit(1)
 
-    # Normal path: a stop signal arrived. Cancel the drain and shut down cleanly.
-    task.cancel()
+    # Normal path: a stop signal arrived. WS-4 §5.2: ask the worker to stop
+    # cooperatively (finish the current cycle + shielded confirm), wait briefly,
+    # then cancel as a backstop if it does not return in time.
+    svc.request_stop()
     try:
-        await task
+        await asyncio.wait_for(task, timeout=config.flush_interval + 5.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "drain did not stop within grace period — cancelling",
+        )
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     except asyncio.CancelledError:
         pass
     logger.info("stopped")
+
+
+async def run_service_main(config_path: Path) -> None:
+    """Entry point with signal handling.  Runs until SIGTERM / SIGINT.
+
+    Signal handlers:
+        SIGTERM / SIGINT — graceful shutdown (finish current cycle, then stop)
+        SIGUSR1 — trigger integrity verification between drain cycles
+                  (result logged at INFO level; not available on Windows)
+    """
+    from sqloutbox.sync import OutboxSyncService
+
+    config, writers = load_config_toml(config_path)
+
+    # WS-4 §5.1: exactly one drain per db_dir. Held for the process lifetime;
+    # released in the finally below. A second drain on the same dir exits(1).
+    lock_handle = acquire_single_drain_lock(config.db_dir)
+    try:
+        svc = OutboxSyncService(config=config, writers=writers)
+        await _run_service_body(config_path, config, svc)
+    finally:
+        release_single_drain_lock(lock_handle)

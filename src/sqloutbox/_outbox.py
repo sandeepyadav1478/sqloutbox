@@ -232,14 +232,20 @@ class Outbox:
         n = limit or self.batch_size
         with thread_conn(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT seq, tag, payload, prev_seq, source "
+                "SELECT seq, tag, payload, prev_seq, source, "
+                "attempts, last_attempt_at, last_error, last_error_class "
                 "FROM outbox_queue "
                 "WHERE namespace = ? AND synced = 0 "
                 "ORDER BY seq LIMIT ?",
                 [self.namespace, n],
             ).fetchall()
         return [
-            QueueRow(seq=r[0], tag=r[1], payload=r[2].encode(), prev_seq=r[3], source=r[4] or "")
+            QueueRow(
+                seq=r[0], tag=r[1], payload=r[2].encode(), prev_seq=r[3],
+                source=r[4] or "",
+                attempts=r[5], last_attempt_at=r[6],
+                last_error=r[7], last_error_class=r[8],
+            )
             for r in rows
         ]
 

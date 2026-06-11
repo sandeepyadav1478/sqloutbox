@@ -37,3 +37,29 @@ class QueueRow:
     payload:  bytes
     prev_seq: int | None
     source:   str = ""   # middleware that produced this row (e.g. "SchedulerMiddleware")
+    # WS-1/WS-2 retry tracking (persisted on outbox_queue). Defaulted so existing
+    # callers that build QueueRow with 5 args keep working.
+    attempts:         int = 0
+    last_attempt_at:  str | None = None   # ISO-8601 UTC, NULL until first attempt
+    last_error:       str | None = None   # destination error of the last failed attempt
+    last_error_class: str | None = None   # TRANSIENT|DETERMINISTIC|ALREADY_APPLIED|UNKNOWN
+
+
+@dataclass(frozen=True)
+class DeadRow:
+    """One row read from outbox_dead_log — a quarantined, replayable event.
+
+    Mirrors the outbox_dead_log table columns (see _schema.py::_CREATE_DEAD_LOG).
+    A row lands here only via Outbox.dead_letter(); it is never lost, only moved.
+    """
+    seq:              int
+    namespace:        str
+    tag:              str
+    payload:          bytes
+    prev_seq:         int | None
+    source:           str | None
+    attempts:         int
+    last_error:       str | None
+    last_error_class: str | None
+    dead_lettered_at: str
+    reason:           str

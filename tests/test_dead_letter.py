@@ -63,3 +63,51 @@ def test_schema_migration_idempotent(tmp_path: Path):
         assert _table_exists(conn, "outbox_dead_log")
     finally:
         conn.close()
+
+
+from sqloutbox._models import DeadRow, QueueRow
+from sqloutbox._outbox import Outbox
+
+
+def test_queue_row_has_retry_fields_defaulted():
+    # Old call sites (5 positional args) must still construct.
+    r = QueueRow(seq=1, tag="SQL", payload=b"[]", prev_seq=None, source="src")
+    assert r.attempts == 0
+    assert r.last_attempt_at is None
+    assert r.last_error is None
+    assert r.last_error_class is None
+
+
+def test_fetch_unsynced_populates_retry_fields(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    # Simulate two prior failed attempts persisted on the row.
+    conn = ob._write_conn
+    conn.execute(
+        "UPDATE outbox_queue SET attempts=2, last_attempt_at='2026-06-11T00:00:00+00:00', "
+        "last_error='boom', last_error_class='TRANSIENT' WHERE seq=?",
+        (seq,),
+    )
+    conn.commit()
+    rows = ob.fetch_unsynced()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.attempts == 2
+    assert r.last_attempt_at == "2026-06-11T00:00:00+00:00"
+    assert r.last_error == "boom"
+    assert r.last_error_class == "TRANSIENT"
+
+
+def test_dead_row_is_frozen():
+    d = DeadRow(
+        seq=5, namespace="evt", tag="SQL", payload=b"[]", prev_seq=4, source="s",
+        attempts=10, last_error="boom", last_error_class="DETERMINISTIC",
+        dead_lettered_at="2026-06-11T00:00:00+00:00", reason="max_attempts",
+    )
+    assert d.reason == "max_attempts"
+    import dataclasses
+    try:
+        d.seq = 6  # type: ignore[misc]
+        raise AssertionError("DeadRow should be frozen")
+    except dataclasses.FrozenInstanceError:
+        pass

@@ -823,7 +823,26 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ## Task 4: Log hygiene — log-once-on-transition for a stuck namespace
 
-Implements WS-6 / F040, F041: a persistently-stuck namespace must NOT WARN every cycle (log spam) — it WARNs once when it *transitions* into the stuck state and stays quiet until it recovers (then logs the recovery once). The current drain logs a `warning` for every failed row on every flush (`sync.py:669`). Add a per-namespace "already warned" set so the WARN fires only on the not-stuck → stuck transition.
+> **⚠️ CORRECTED 2026-06-11 (re-anchored onto shipped WS-1/2 source).** This task
+> was written against a pre-WS-1/2 `_flush_to_target` that used a `confirmed_by_table`
+> loop with a per-row `logger.warning("write failed for…")`. That structure NO LONGER
+> EXISTS — the WS-1/2 head-of-line-hold rewrite replaced it (the current loop is
+> `for table, items in by_table.items():` with a genuine-hold `break`, and it already
+> logs `'%s' seq=%d held (attempt %d…)`). Additionally the **WS-1 backoff gate**
+> (`_backoff_eligible` in `_worker_loop`) already suppresses a stuck head until its
+> `2^attempts`-minute backoff elapses, so the original per-cycle spam is already
+> largely mitigated. The once-on-transition stuck/recovered signal is still a clean
+> win, but **execute the CORRECTED Step 1 (tests) and Step 3 (impl) given in the
+> workflow prompt / below**, not the originals. Key corrections: (a) tests must
+> `monkeypatch.setattr(sqloutbox.sync, "_backoff_eligible", lambda *a, **k: True)`
+> so the head is re-fetched every cycle (else the gate throttles retries and
+> `writer.calls` stays at 1); (b) use `max_attempts=None` so the stuck head is never
+> dead-lettered; (c) demote the existing per-retry `held` WARNING to DEBUG (zero blast
+> radius — NO existing test asserts on that text) and add the once-on-transition
+> `namespace stuck` WARN + `namespace recovered` INFO inside the `for table, items`
+> loop. Anchor by the quoted current code, not the stale line numbers below.
+
+Implements WS-6 / F040, F041: a persistently-stuck namespace must NOT WARN every cycle (log spam) — it WARNs once when it *transitions* into the stuck state and stays quiet until it recovers (then logs the recovery once). ~~The current drain logs a `warning` for every failed row on every flush (`sync.py:669`).~~ Add a per-namespace "already warned" (`self._stuck_namespaces`) set so the WARN fires only on the not-stuck → stuck transition.
 
 **Files:**
 - Modify: `src/sqloutbox/sync.py`
@@ -1071,7 +1090,20 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-## Task 5: Writerless / degraded target WARN-once at startup (F020)
+## Task 5: ~~Writerless / degraded target WARN-once at startup (F020)~~ — SUPERSEDED BY WS-4, SKIPPED
+
+> **⛔ SKIPPED 2026-06-11 (superseded by WS-4 Task 3).** This task proposed a *soft*
+> WARN-and-continue for a writerless target. But Plan 4 (WS-4 Task 3, commit `58adcb6`)
+> already shipped a STRICTER guarantee: a writerless target is a **hard `raise
+> ValueError` at `OutboxSyncService.__init__`** (`sync.py` `__init__`, the
+> `missing = [t.name for t in config.targets if t.name not in writers]` block). A
+> constructor that raises can never reach a warn-and-continue path, and the two tests
+> here construct a service with a missing writer expecting it to SUCCEED — they would
+> fail against shipped code. Per the user's explicit decision (2026-06-11), the WS-4
+> fail-fast raise is kept and **this task is dropped entirely** (the fail-fast is safer:
+> an unconfigured target is almost always a deploy bug, better caught at construction
+> than black-holed). F020 is satisfied by WS-4's raise, not by a WARN. Do NOT implement
+> the body below; do NOT add its tests.
 
 Implements WS-6 / F020 and hardening §5.3: a target listed in config but with **no writer** is currently silently skipped in `run()` (`sync.py:558-559` and `:307-308`), yet it still appears in the "started" banner. WARN once at construction naming each writerless target so an operator sees the black hole instead of silent loss.
 

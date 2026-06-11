@@ -67,6 +67,13 @@ from sqloutbox.middleware import SQLMiddleware
 from sqloutbox.sync import OutboxSyncService, OutboxWriter, inject_outbox_seq
 from sqloutbox._runner import load_config_toml
 from sqloutbox._verify import TableVerifyResult, VerifyResult, verify_all, verify_outbox
+from sqloutbox.exceptions import (
+    ChainIntegrityError,
+    ConfigError,
+    QueueFullError,
+    SqloutboxError,
+    UnsupportedStatementError,
+)
 
 __all__ = [
     # Core queue
@@ -90,4 +97,10 @@ __all__ = [
     "VerifyResult",
     "verify_outbox",
     "verify_all",
+    # Exceptions
+    "SqloutboxError",
+    "ConfigError",
+    "QueueFullError",
+    "UnsupportedStatementError",
+    "ChainIntegrityError",
 ]

@@ -395,6 +395,49 @@ class Outbox:
             ).fetchone()
         return row[0] if row else 0
 
+    def peek_head(self) -> QueueRow | None:
+        """Return the lowest-seq undelivered row in this namespace, or None.
+
+        This is the row whose backoff clock the drain reads (attempts /
+        last_attempt_at) to decide whether the namespace is eligible to retry.
+        Read-only; opens its own connection (safe from any thread).
+        """
+        with thread_conn(self.db_path) as conn:
+            r = conn.execute(
+                "SELECT seq, tag, payload, prev_seq, source, "
+                "attempts, last_attempt_at, last_error, last_error_class "
+                "FROM outbox_queue "
+                "WHERE namespace = ? AND synced = 0 "
+                "ORDER BY seq LIMIT 1",
+                [self.namespace],
+            ).fetchone()
+        if r is None:
+            return None
+        return QueueRow(
+            seq=r[0], tag=r[1], payload=r[2].encode(), prev_seq=r[3],
+            source=r[4] or "",
+            attempts=r[5], last_attempt_at=r[6],
+            last_error=r[7], last_error_class=r[8],
+        )
+
+    def record_attempt(self, seq: int, error: str, error_class: str) -> None:
+        """Record a failed delivery attempt on one row.
+
+        Increments ``attempts`` and stores the destination error + its class
+        and the attempt timestamp (ISO-8601 UTC). Persisted so the §3.2 backoff
+        gate and the §3.4 health signal can read it back, possibly cross-process.
+        Opens its own connection — safe to call from any thread.
+        """
+        with thread_conn(self.db_path) as conn:
+            conn.execute(
+                "UPDATE outbox_queue "
+                "SET attempts = attempts + 1, last_attempt_at = ?, "
+                "    last_error = ?, last_error_class = ? "
+                "WHERE namespace = ? AND seq = ?",
+                [now_iso(), error, error_class, self.namespace, seq],
+            )
+            conn.commit()
+
     # ── Seeding ──────────────────────────────────────────────────────────────
 
     def seed_sequence(self, min_seq: int) -> bool:
@@ -452,10 +495,16 @@ class Outbox:
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _seq_accounted(self, conn: sqlite3.Connection, seq: int) -> bool:
-        """Return True if seq exists in queue OR sync_log. One UNION query."""
+        """Return True if seq exists in queue OR sync_log OR dead_log.
+
+        A row moved to outbox_dead_log is "accounted": it has been durably
+        relocated (not lost), so its successor's prev_seq chain check must still
+        pass. One UNION query across the three stores.
+        """
         return bool(conn.execute(
             "SELECT 1 FROM outbox_queue WHERE seq = ? "
             "UNION SELECT 1 FROM outbox_sync_log WHERE seq = ? "
+            "UNION SELECT 1 FROM outbox_dead_log WHERE seq = ? "
             "LIMIT 1",
-            [seq, seq],
+            [seq, seq, seq],
         ).fetchone())

@@ -111,3 +111,51 @@ def test_dead_row_is_frozen():
         raise AssertionError("DeadRow should be frozen")
     except dataclasses.FrozenInstanceError:
         pass
+
+
+def test_peek_head_returns_lowest_seq_unsynced(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+    head = ob.peek_head()
+    assert head is not None
+    assert head.seq == s1
+    assert head.attempts == 0
+
+
+def test_peek_head_none_when_empty(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    assert ob.peek_head() is None
+
+
+def test_record_attempt_increments_and_persists(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    ob.record_attempt(seq, error="connection refused", error_class="TRANSIENT")
+    head = ob.peek_head()
+    assert head is not None
+    assert head.attempts == 1
+    assert head.last_error == "connection refused"
+    assert head.last_error_class == "TRANSIENT"
+    assert head.last_attempt_at is not None
+    # A second failure increments again.
+    ob.record_attempt(seq, error="still down", error_class="TRANSIENT")
+    assert ob.peek_head().attempts == 2
+
+
+def test_seq_accounted_consults_dead_log(tmp_path: Path):
+    import sqlite3
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    # Manually insert a dead-lettered row at seq=7 (no queue/sync_log row exists).
+    conn = ob._write_conn
+    conn.execute(
+        "INSERT INTO outbox_dead_log "
+        "(seq, namespace, tag, payload, prev_seq, source, attempts, "
+        " last_error, last_error_class, dead_lettered_at, reason) "
+        "VALUES (7, 'evt', 'SQL', '[]', NULL, 's', 10, 'boom', 'UNKNOWN', "
+        "        '2026-06-11T00:00:00+00:00', 'max_attempts')"
+    )
+    conn.commit()
+    with sqlite3.connect(str(ob.db_path)) as c:
+        assert ob._seq_accounted(c, 7) is True
+        assert ob._seq_accounted(c, 999) is False

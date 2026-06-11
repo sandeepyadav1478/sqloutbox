@@ -272,6 +272,46 @@ def inject_outbox_seq(
     return s, list(args) + [outbox_seq]
 
 
+def classify_write_error(error: str | None) -> str:
+    """Classify a destination write error per FIRST spec §3.3.
+
+    Returns one of: TRANSIENT | DETERMINISTIC | ALREADY_APPLIED | UNKNOWN.
+    Substring-based and conservative — UNKNOWN is the safe default (retry).
+    Classification changes REPORTING only: no class drops data. ALREADY_APPLIED
+    is the single class the drain treats as success (a UNIQUE collision on an
+    idempotent INSERT proves the row's key already exists at the destination).
+    """
+    if not error:
+        return "UNKNOWN"
+    e = error.lower()
+
+    # ALREADY_APPLIED first: a UNIQUE/duplicate-key collision means the row is
+    # provably present at the destination (idempotent INSERT OR IGNORE). Checked
+    # before DETERMINISTIC because "constraint" also appears in FK/NOT NULL text.
+    if "unique constraint" in e or "duplicate key" in e or "already exists" in e:
+        return "ALREADY_APPLIED"
+
+    # TRANSIENT: network / 5xx / timeout / contended lock — retry with backoff.
+    if (
+        "timeout" in e or "timed out" in e
+        or "connection" in e or "reset" in e
+        or "temporarily unavailable" in e or "503" in e or "502" in e
+        or "504" in e or "database is locked" in e or "busy" in e
+    ):
+        return "TRANSIENT"
+
+    # DETERMINISTIC: schema / SQL faults — retry w/ backoff (may clear after a
+    # destination migration or once a prior row lands), but never dropped.
+    if (
+        "foreign key" in e or "not null" in e
+        or "no such column" in e or "no such table" in e
+        or "syntax error" in e or "constraint failed" in e
+    ):
+        return "DETERMINISTIC"
+
+    return "UNKNOWN"
+
+
 # ── Sync service ─────────────────────────────────────────────────────────────
 
 

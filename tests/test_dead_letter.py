@@ -219,3 +219,31 @@ def test_get_dead_returns_one_row(tmp_path: Path):
     d = ob.get_dead(seq)
     assert d is not None and d.reason == "undecodable"
     assert ob.get_dead(12345) is None
+
+
+from sqloutbox.sync import classify_write_error
+
+
+def test_classify_transient():
+    for msg in ["connection reset", "HTTP 503 Service Unavailable",
+                "request timed out", "database is locked"]:
+        assert classify_write_error(msg) == "TRANSIENT"
+
+
+def test_classify_deterministic():
+    for msg in ["FOREIGN KEY constraint failed", "NOT NULL constraint failed",
+                "no such column: foo", "no such table: bar",
+                "syntax error near \"VALUE\""]:
+        assert classify_write_error(msg) == "DETERMINISTIC"
+
+
+def test_classify_already_applied():
+    for msg in ["UNIQUE constraint failed: events.outbox_seq",
+                "duplicate key value violates unique constraint"]:
+        assert classify_write_error(msg) == "ALREADY_APPLIED"
+
+
+def test_classify_unknown():
+    assert classify_write_error("") == "UNKNOWN"
+    assert classify_write_error("some wholly unrecognised message") == "UNKNOWN"
+    assert classify_write_error(None) == "UNKNOWN"

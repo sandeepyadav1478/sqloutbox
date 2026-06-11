@@ -605,10 +605,21 @@ class OutboxSyncService:
                         continue
 
                     for row in rows:
-                        sql = row.tag
-                        args = json.loads(row.payload.decode())
-                        if target.should_inject_seq(table):
-                            sql, args = inject_outbox_seq(sql, args, row.seq)
+                        try:
+                            sql = row.tag
+                            args = json.loads(row.payload.decode())
+                            if target.should_inject_seq(table):
+                                sql, args = inject_outbox_seq(sql, args, row.seq)
+                        except Exception as exc:
+                            # L1: a single undecodable / untransformable row must
+                            # not escape the cycle and zombify the daemon. Log once
+                            # and skip it THIS cycle (it stays pending; permanent
+                            # dead-letter routing arrives in the WS-2 plan).
+                            logger.error(
+                                "[outbox_sync] skipping bad row table='%s' seq=%d: %s",
+                                table, row.seq, exc,
+                            )
+                            continue
                         all_stmts.append((sql, args))
                         stmt_info.append((table, row.seq))
 

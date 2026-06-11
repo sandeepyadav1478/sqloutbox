@@ -220,3 +220,32 @@ def test_mark_delete_synced_chunk_boundary_correct(tmp_path: Path):
         ob.mark_synced(seqs)
         ob.delete_synced(seqs)
         assert ob.pending_count() == 0
+
+
+# ── Watermark ownership contract (doc + library-boundary assertion) ───────────
+
+import sqloutbox
+from sqloutbox import OutboxConfig
+
+
+def test_library_owns_max_pending_not_the_watermark(tmp_path: Path):
+    """max_pending is library config; the 80% watermark is NOT a library symbol.
+
+    The library reports the number (depth / max_pending). The stop-producing
+    threshold lives in the PRODUCING APPLICATION, so sqloutbox must not export
+    a STOP_WATERMARK_PCT constant or any auto-resume control.
+    """
+    cfg = OutboxConfig(db_dir=tmp_path, max_pending=1000)
+    assert cfg.max_pending == 1000                 # library owns the hard cap
+    # The watermark percentage is NOT a library-owned symbol.
+    assert not hasattr(sqloutbox, "STOP_WATERMARK_PCT")
+    assert "STOP_WATERMARK_PCT" not in getattr(sqloutbox, "__all__", [])
+
+
+def test_readme_documents_watermark_as_producer_policy():
+    """README states the watermark is a producing-app policy with no auto-resume."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    assert "max_pending" in readme
+    # The doc must make the ownership + no-auto-resume contract explicit.
+    assert "80%" in readme
+    assert "no auto-resume" in readme.lower() or "manual" in readme.lower()

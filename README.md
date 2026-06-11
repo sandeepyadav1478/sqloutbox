@@ -213,6 +213,33 @@ db_token = "${DB_TOKEN}"
 
 This calls `TursoWriter(db_url="...", db_token="...")`.
 
+### Supported SQL grammar for `inject_outbox_seq`
+
+When a target has `inject_outbox_seq` enabled, the drain rewrites each row's
+SQL to carry the `outbox_seq` column. The rewrite uses a conservative,
+string-literal-aware lexer that accepts **only** two shapes:
+
+```sql
+-- single-row INSERT with an explicit column list:
+INSERT INTO t (c1, c2) VALUES (?, ?)
+    -- → INSERT OR IGNORE INTO t (c1, c2, outbox_seq) VALUES (?, ?, ?)
+
+-- UPDATE with at least one real bind placeholder in SET:
+UPDATE t SET c1=?, c2=? WHERE id=?
+    -- → UPDATE t SET c1=?, c2=?, outbox_seq = ? WHERE id=?
+```
+
+Everything else is **rejected loudly** with `UnsupportedStatementError`
+(never silently rewritten):
+
+- `INSERT … SELECT …` (no `VALUES` list)
+- multi-row `INSERT … VALUES (…), (…)`
+- a `?`, `)`, or `WHERE` that appears **inside a quoted string literal**
+- an `UPDATE` whose only `?` is inside a literal (no real SET placeholder)
+
+If you must deliver an unsupported shape, route its table to a target with
+`inject_outbox_seq=False` (delivered verbatim, no rewrite).
+
 ### Programmatic TOML loading
 
 ```python
@@ -258,6 +285,35 @@ A gap blocks delivery and logs an error (never silently drops events).
 
 After delivery, rows are recorded in `outbox_sync_log` so future gap checks
 can confirm the row was delivered, not lost.
+
+### Backpressure (`max_pending`) and the stop-producing watermark
+
+`sqloutbox` is **unbounded by default** — `enqueue()` never raises and the
+queue grows until the drain catches up. `health().depth` (per namespace)
+surfaces the backlog so you can monitor it.
+
+To bound the queue, set `max_pending` on the config. It is a **two-tier,
+pull-based** model — the library only ever *reports a number*; it never calls
+back into your app, never pauses it, and never resumes it:
+
+| Tier | Who acts | Trigger | Action |
+|------|----------|---------|--------|
+| **Stop watermark (80%)** | your **producing application** | `depth >= 80% * max_pending` (polled) | the producer stops enqueuing |
+| **Hard cap (100%)** | the **library** | `enqueue()` while `pending >= max_pending` | raises `QueueFullError(namespace, max_pending)` |
+
+The **80% `STOP_WATERMARK_PCT` is a producing-application policy, not library
+config** — the library does not own "80". Your producer polls `health().depth`
+(Plan 6 adds a derived `capacity_pct = depth / max_pending` convenience) and
+stops enqueuing at its own threshold; the `QueueFullError` hard cap is the
+library backstop for a bare producer that does not poll.
+
+**There is no auto-resume — deliberately.** A fast-rising backlog is a
+*symptom*: the cause may be a slow/down remote (the drain will clear it) OR a
+**bug in the producer itself** flooding wrong messages. Auto-resuming would
+re-arm a faulty producer. So once the producer stops, an **operator restarts
+it manually** after diagnosing why the queue filled (and may quarantine the
+already-queued bad rows via the dead-letter CLI). sqloutbox's drain service
+**never stops or starts** — it keeps draining the backlog down throughout.
 
 ### Idempotent delivery
 

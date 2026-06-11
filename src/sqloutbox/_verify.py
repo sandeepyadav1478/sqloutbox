@@ -21,12 +21,13 @@ All checks are read-only — they never modify the database.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqloutbox._schema import now_iso, open_read_conn, thread_conn
+from sqloutbox._schema import now_iso, open_read_conn
 
 if TYPE_CHECKING:
     from sqloutbox._outbox import Outbox
@@ -95,8 +96,6 @@ def verify_db_path(db_path: Path, namespace: str | None = None) -> TableVerifyRe
         holds multiple namespaces the first (by name) is used and the rest are
         ignored — the CLI constructs one Outbox per file/namespace anyway.
     """
-    import sqlite3
-
     db_path = Path(db_path)
     errors: list[str] = []
     label = namespace if namespace is not None else db_path.stem

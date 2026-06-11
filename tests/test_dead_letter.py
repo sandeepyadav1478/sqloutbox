@@ -159,3 +159,63 @@ def test_seq_accounted_consults_dead_log(tmp_path: Path):
     with sqlite3.connect(str(ob.db_path)) as c:
         assert ob._seq_accounted(c, 7) is True
         assert ob._seq_accounted(c, 999) is False
+
+
+def test_dead_letter_moves_row_atomically(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]", source="prod")
+    ob.record_attempt(seq, error="boom", error_class="DETERMINISTIC")
+    ob.dead_letter(seq, reason="max_attempts")
+
+    # Row gone from the queue, present in dead_log with full metadata.
+    assert ob.pending_count() == 0
+    dead = ob.list_dead()
+    assert len(dead) == 1
+    d = dead[0]
+    assert d.seq == seq
+    assert d.namespace == "evt"
+    assert d.tag == "INSERT INTO evt (a) VALUES (?)"
+    assert d.payload == b"[1]"
+    assert d.source == "prod"
+    assert d.attempts == 1
+    assert d.last_error == "boom"
+    assert d.last_error_class == "DETERMINISTIC"
+    assert d.reason == "max_attempts"
+    assert d.dead_lettered_at is not None
+
+
+def test_dead_letter_unknown_seq_is_noop(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    # No such row — must not raise, must not create a dead_log entry.
+    ob.dead_letter(999, reason="manual_skip")
+    assert ob.list_dead() == []
+
+
+def test_replay_reenqueues_at_tail_with_new_seq(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    s2 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+    # Dead-letter the head (s1), then advance the chain past it by leaving s2.
+    ob.dead_letter(s1, reason="manual_skip")
+
+    new_seq = ob.replay(s1)
+    assert new_seq is not None
+    assert new_seq > s2  # at the tail, a brand-new seq (old seq never reused)
+
+    # Removed from dead_log, present again in the queue with the original payload.
+    assert ob.list_dead() == []
+    rows = ob.fetch_unsynced()
+    payloads = {r.payload for r in rows}
+    assert b"[1]" in payloads
+    # The replayed row links to the previous tail (s2), a valid new chain link.
+    replayed = next(r for r in rows if r.seq == new_seq)
+    assert replayed.prev_seq == s2
+
+
+def test_get_dead_returns_one_row(tmp_path: Path):
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[9]")
+    ob.dead_letter(seq, reason="undecodable")
+    d = ob.get_dead(seq)
+    assert d is not None and d.reason == "undecodable"
+    assert ob.get_dead(12345) is None

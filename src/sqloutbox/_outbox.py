@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from sqloutbox._models import QueueRow
+from sqloutbox._models import DeadRow, QueueRow
 from sqloutbox._schema import (
     now_iso,
     open_write_conn,
@@ -437,6 +437,118 @@ class Outbox:
                 [now_iso(), error, error_class, self.namespace, seq],
             )
             conn.commit()
+
+    def dead_letter(self, seq: int, reason: str) -> bool:
+        """Atomically MOVE one queue row to outbox_dead_log (never lose it).
+
+        INSERT INTO outbox_dead_log (...) SELECT (...) FROM outbox_queue WHERE seq=?
+        then DELETE FROM outbox_queue WHERE seq=? — in one transaction. The row is
+        relocated to an audited, replayable store, not destroyed. After the move,
+        _seq_accounted() still returns True for ``seq`` (it consults dead_log), so
+        the successor's chain check passes and the namespace head advances.
+
+        ``reason`` is one of: 'max_attempts' | 'manual_skip' | 'undecodable' |
+        'unsupported_stmt'. Returns True if a row was moved, False if ``seq`` was
+        absent (no-op). Never raises on a missing row.
+        """
+        try:
+            self._write_conn.execute("BEGIN IMMEDIATE")
+            cur = self._write_conn.execute(
+                "INSERT OR IGNORE INTO outbox_dead_log "
+                "(seq, namespace, tag, payload, prev_seq, source, attempts, "
+                " last_error, last_error_class, dead_lettered_at, reason) "
+                "SELECT seq, namespace, tag, payload, prev_seq, source, attempts, "
+                "       last_error, last_error_class, ?, ? "
+                "FROM outbox_queue WHERE namespace = ? AND seq = ?",
+                [now_iso(), reason, self.namespace, seq],
+            )
+            moved = cur.rowcount > 0
+            if moved:
+                self._write_conn.execute(
+                    "DELETE FROM outbox_queue WHERE namespace = ? AND seq = ?",
+                    [self.namespace, seq],
+                )
+            self._write_conn.commit()
+            if moved:
+                logger.warning(
+                    "sqloutbox[%s]: dead-lettered seq=%d reason=%s",
+                    self.namespace, seq, reason,
+                )
+            return moved
+        except Exception as exc:
+            try:
+                self._write_conn.rollback()
+            except Exception:
+                pass
+            logger.error(
+                "sqloutbox[%s]: dead_letter failed seq=%d: %s",
+                self.namespace, seq, exc,
+            )
+            return False
+
+    def replay(self, seq: int) -> int | None:
+        """Re-enqueue a dead-lettered row at the TAIL with a NEW seq.
+
+        Reads the dead_log row, enqueues a fresh copy (preserving tag/payload/
+        source) — which assigns a brand-new AUTOINCREMENT seq and links it to the
+        current tail — then deletes the dead_log entry. The OLD seq is never
+        reused (AUTOINCREMENT guarantees this), so this is a new chain link, not a
+        gap-fill. Returns the new seq, or None if ``seq`` was not in the dead_log.
+        """
+        d = self.get_dead(seq)
+        if d is None:
+            return None
+        new_seq = self.enqueue(d.tag, d.payload, source=d.source or "")
+        if new_seq is None:
+            return None
+        with thread_conn(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM outbox_dead_log WHERE namespace = ? AND seq = ?",
+                [self.namespace, seq],
+            )
+            conn.commit()
+        logger.info(
+            "sqloutbox[%s]: replayed dead seq=%d → new seq=%d",
+            self.namespace, seq, new_seq,
+        )
+        return new_seq
+
+    def list_dead(self) -> list[DeadRow]:
+        """Return all dead-lettered rows for this namespace, oldest seq first."""
+        with thread_conn(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT seq, namespace, tag, payload, prev_seq, source, attempts, "
+                "last_error, last_error_class, dead_lettered_at, reason "
+                "FROM outbox_dead_log WHERE namespace = ? ORDER BY seq",
+                [self.namespace],
+            ).fetchall()
+        return [
+            DeadRow(
+                seq=r[0], namespace=r[1], tag=r[2], payload=r[3].encode(),
+                prev_seq=r[4], source=r[5], attempts=r[6],
+                last_error=r[7], last_error_class=r[8],
+                dead_lettered_at=r[9], reason=r[10],
+            )
+            for r in rows
+        ]
+
+    def get_dead(self, seq: int) -> DeadRow | None:
+        """Return one dead-lettered row by seq, or None if absent."""
+        with thread_conn(self.db_path) as conn:
+            r = conn.execute(
+                "SELECT seq, namespace, tag, payload, prev_seq, source, attempts, "
+                "last_error, last_error_class, dead_lettered_at, reason "
+                "FROM outbox_dead_log WHERE namespace = ? AND seq = ?",
+                [self.namespace, seq],
+            ).fetchone()
+        if r is None:
+            return None
+        return DeadRow(
+            seq=r[0], namespace=r[1], tag=r[2], payload=r[3].encode(),
+            prev_seq=r[4], source=r[5], attempts=r[6],
+            last_error=r[7], last_error_class=r[8],
+            dead_lettered_at=r[9], reason=r[10],
+        )
 
     # ── Seeding ──────────────────────────────────────────────────────────────
 

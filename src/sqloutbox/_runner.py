@@ -589,7 +589,23 @@ async def run_service_main(config_path: Path) -> None:
         loop.add_signal_handler(signal.SIGUSR1, _on_verify)
 
     task = loop.create_task(svc.run(), name="sqloutbox.drain")
-    await stop.wait()
+    stop_task = loop.create_task(stop.wait(), name="sqloutbox.stop")
+
+    done, _pending = await asyncio.wait(
+        {task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if task in done:
+        # The drain exited on its own — this is always a fault (the worker loop
+        # is an infinite loop; it only returns/raises on error). Surface it
+        # LOUDLY so a supervisor (systemd Restart=on-failure) restarts us,
+        # instead of lingering as a zombie with a dead worker.
+        stop_task.cancel()
+        exc = task.exception()
+        logger.critical("drain worker exited unexpectedly: %r", exc)
+        raise SystemExit(1)
+
+    # Normal path: a stop signal arrived. Cancel the drain and shut down cleanly.
     task.cancel()
     try:
         await task

@@ -137,3 +137,71 @@ async def test_corrupt_namespace_isolated_siblings_drain(tmp_path: Path):
 
     # 'good' was delivered despite 'bad' raising every cycle.
     assert any("good" in sql for sql, _ in writer.seen)
+
+
+from sqloutbox import _runner
+
+
+@pytest.mark.asyncio
+async def test_runner_exits_nonzero_when_worker_dies(monkeypatch, tmp_path: Path):
+    """If the drain task faults, the runner must raise SystemExit(1), not hang."""
+
+    class _DyingService:
+        async def run(self):
+            raise RuntimeError("worker exploded")
+
+    # Patch the pieces run_service_main needs so we exercise ONLY the task-watch logic.
+    monkeypatch.setattr(
+        _runner, "load_config_toml",
+        lambda _p: (_FakeConfig(), {}),
+    )
+    monkeypatch.setattr(
+        "sqloutbox.sync.OutboxSyncService",
+        lambda **_kw: _DyingService(),
+    )
+
+    with pytest.raises(SystemExit) as ei:
+        await asyncio.wait_for(_runner.run_service_main(tmp_path / "outbox.toml"), timeout=2.0)
+    assert ei.value.code == 1
+
+
+class _FakeConfig:
+    """Minimal stand-in for the loaded config (only what run_service_main reads)."""
+    flush_interval = 1.0
+    table_flush_threshold = 15
+    table_max_wait = 6.0
+    db_dir = Path("/tmp")
+    targets = ()
+
+
+@pytest.mark.asyncio
+async def test_runner_clean_stop_does_not_raise(monkeypatch, tmp_path: Path):
+    """A normal stop signal shuts down cleanly (no SystemExit)."""
+    import signal as _signal
+
+    started = asyncio.Event()
+
+    class _LiveService:
+        async def run(self):
+            started.set()
+            while True:
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(_runner, "load_config_toml", lambda _p: (_FakeConfig(), {}))
+    monkeypatch.setattr("sqloutbox.sync.OutboxSyncService", lambda **_kw: _LiveService())
+
+    # Capture the handlers the runner registers, without touching process-wide
+    # signal state. Shadows the bound method on this loop instance only.
+    loop = asyncio.get_running_loop()
+    handlers: dict[int, object] = {}
+
+    def _capture(sig, cb, *a):
+        handlers[sig] = cb
+
+    monkeypatch.setattr(loop, "add_signal_handler", _capture)
+
+    runner_task = asyncio.create_task(_runner.run_service_main(tmp_path / "outbox.toml"))
+    await started.wait()                 # service is running, handlers registered
+    handlers[_signal.SIGINT]()           # fire the stop handler the runner set
+    # Completes WITHOUT SystemExit (clean-stop path), within the timeout.
+    await asyncio.wait_for(runner_task, timeout=2.0)

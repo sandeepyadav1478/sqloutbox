@@ -34,6 +34,61 @@ from pathlib import Path
 _DEFAULT_DIR = "outbox"
 
 
+# ── Built-in writer ────────────────────────────────────────────────────────────
+#
+# A real, importable Turso / libSQL HTTP pipeline writer. TOML configs can point
+# ``writer_class`` at ``sqloutbox.cli:TursoWriter`` without scaffolding a Python
+# config module. The scaffolded outbox_config.py (see _CONFIG_TEMPLATE below)
+# carries its own standalone copy for projects that customise it.
+
+
+class TursoWriter:
+    """Turso / libSQL HTTP pipeline writer."""
+
+    def __init__(self, db_url: str, db_token: str) -> None:
+        self._pipeline_url = f"{db_url}/v2/pipeline"
+        self._token = db_token
+        self._client = None
+
+    def _http(self):
+        if self._client is None:
+            import httpx
+            self._client = httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=30.0,
+            )
+        return self._client
+
+    async def write_batch(self, stmts: list[tuple[str, list]]) -> list[dict]:
+        if not stmts:
+            return []
+        pipeline = [
+            {"type": "execute", "stmt": {"sql": sql, "args": args}}
+            for sql, args in stmts
+        ]
+        resp = await self._http().post(
+            self._pipeline_url, json={"requests": pipeline},
+        )
+        resp.raise_for_status()
+        results = []
+        for entry in resp.json()["results"]:
+            if entry.get("type") == "error":
+                results.append({
+                    "ok": False, "rows_affected": 0,
+                    "error": entry.get("error", {}).get("message", ""),
+                })
+            else:
+                r = entry["response"]["result"]
+                result = {"ok": True, "rows_affected": r.get("rows_affected", 0)}
+                if "rows" in r:
+                    result["rows"] = [
+                        [col.get("value") for col in row]
+                        for row in r["rows"]
+                    ]
+                results.append(result)
+        return results
+
+
 # ── Templates ────────────────────────────────────────────────────────────────
 
 
@@ -567,6 +622,129 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
     sys.exit(0 if result.ok else 1)
 
 
+# ── dead-letter / skip commands ───────────────────────────────────────────────
+
+
+def _outboxes_from_config(config_path: Path) -> dict:
+    """Map namespace → Outbox for every existing .db file in the TOML config.
+
+    Mirrors cmd_verify's discovery. Returns {namespace: Outbox}.
+    """
+    from sqloutbox._outbox import Outbox
+    from sqloutbox._runner import load_config_toml
+
+    config, _writers = load_config_toml(config_path)
+    outboxes: dict = {}
+    for target in config.targets:
+        db_dir = target.db_dir or config.db_dir
+        for table in target.tables:
+            db_path = db_dir / f"{table}.db"
+            if db_path.exists():
+                outboxes[table] = Outbox(db_path=db_path, namespace=table)
+    return outboxes
+
+
+def cmd_dead_letter(
+    config_path: Path | None,
+    action: str,
+    namespace: str | None,
+    seq: int | None,
+) -> None:
+    """Inspect / replay the dead-letter store.
+
+    actions: list | show | replay
+    """
+    if config_path is None:
+        print("error: --config <file.toml> is required", file=sys.stderr)
+        sys.exit(1)
+
+    outboxes = _outboxes_from_config(config_path)
+    if not outboxes:
+        print("no .db files found — nothing to inspect")
+        sys.exit(0)
+
+    if action == "list":
+        any_dead = False
+        print()
+        print("sqloutbox dead-letter — quarantined rows")
+        print("-" * 70)
+        for ns, ob in sorted(outboxes.items()):
+            if namespace is not None and ns != namespace:
+                continue
+            for d in ob.list_dead():
+                any_dead = True
+                print(
+                    f"  {ns:<20s}  seq={d.seq:<8d}  reason={d.reason:<14s}  "
+                    f"attempts={d.attempts}  class={d.last_error_class or '-'}"
+                )
+        if not any_dead:
+            print("  (none)")
+        print()
+        return
+
+    # show / replay need a specific namespace + seq.
+    if namespace is None or seq is None:
+        print("error: --namespace and --seq are required for show/replay",
+              file=sys.stderr)
+        sys.exit(1)
+    ob = outboxes.get(namespace)
+    if ob is None:
+        print(f"error: namespace '{namespace}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    if action == "show":
+        d = ob.get_dead(seq)
+        if d is None:
+            print(f"error: no dead row seq={seq} in namespace '{namespace}'",
+                  file=sys.stderr)
+            sys.exit(1)
+        print()
+        print(f"  namespace        {d.namespace}")
+        print(f"  seq              {d.seq}")
+        print(f"  reason           {d.reason}")
+        print(f"  attempts         {d.attempts}")
+        print(f"  last_error_class {d.last_error_class}")
+        print(f"  last_error       {d.last_error}")
+        print(f"  dead_lettered_at {d.dead_lettered_at}")
+        print(f"  source           {d.source}")
+        print(f"  prev_seq         {d.prev_seq}")
+        print(f"  sql              {d.tag}")
+        print(f"  args             {d.payload.decode('utf-8', 'replace')}")
+        print()
+        return
+
+    if action == "replay":
+        new_seq = ob.replay(seq)
+        if new_seq is None:
+            print(f"error: no dead row seq={seq} in namespace '{namespace}'",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"replayed namespace='{namespace}' seq={seq} → new seq={new_seq}")
+        return
+
+    print(f"error: unknown dead-letter action '{action}'", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_skip(config_path: Path | None, namespace: str | None, seq: int | None) -> None:
+    """Manually move a stuck head row → dead_log (reason='manual_skip')."""
+    if config_path is None or namespace is None or seq is None:
+        print("error: --config, --namespace, and --seq are all required",
+              file=sys.stderr)
+        sys.exit(1)
+    outboxes = _outboxes_from_config(config_path)
+    ob = outboxes.get(namespace)
+    if ob is None:
+        print(f"error: namespace '{namespace}' not found", file=sys.stderr)
+        sys.exit(1)
+    if ob.dead_letter(seq, reason="manual_skip"):
+        print(f"skipped namespace='{namespace}' seq={seq} → dead_log")
+        return
+    print(f"error: no queue row seq={seq} in namespace '{namespace}'",
+          file=sys.stderr)
+    sys.exit(1)
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
@@ -604,6 +782,36 @@ def main(argv: list[str] | None = None) -> None:
         help="directory to scan for *.db files",
     )
 
+    p_dl = sub.add_parser(
+        "dead-letter",
+        help="inspect / replay quarantined (dead-lettered) rows",
+    )
+    p_dl.add_argument(
+        "dl_action", choices=("list", "show", "replay"),
+        help="list all, show one, or replay one dead-lettered row",
+    )
+    p_dl.add_argument(
+        "--config", "-c", type=Path, default=None, dest="dl_config",
+        help="TOML config file (discover .db files from targets)",
+    )
+    p_dl.add_argument("--namespace", "-n", default=None,
+                      help="namespace (table) to filter / target")
+    p_dl.add_argument("--seq", "-s", type=int, default=None,
+                      help="dead-letter row seq (required for show/replay)")
+
+    p_skip = sub.add_parser(
+        "skip",
+        help="manually move a stuck head row → dead_log (reason=manual_skip)",
+    )
+    p_skip.add_argument(
+        "--config", "-c", type=Path, default=None, dest="skip_config",
+        help="TOML config file (discover .db files from targets)",
+    )
+    p_skip.add_argument("--namespace", "-n", default=None, required=False,
+                        help="namespace (table) whose head to skip")
+    p_skip.add_argument("--seq", "-s", type=int, default=None, required=False,
+                        help="seq of the stuck head row to skip")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -616,3 +824,7 @@ def main(argv: list[str] | None = None) -> None:
         cmd_runservice(args.config)
     elif args.command == "verify":
         cmd_verify(args.verify_config, args.db_dir)
+    elif args.command == "dead-letter":
+        cmd_dead_letter(args.dl_config, args.dl_action, args.namespace, args.seq)
+    elif args.command == "skip":
+        cmd_skip(args.skip_config, args.namespace, args.seq)

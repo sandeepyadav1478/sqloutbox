@@ -529,3 +529,61 @@ async def test_undecodable_row_is_dead_lettered(tmp_path: Path):
     assert dead[0].seq == seq
     assert dead[0].reason == "undecodable"
     assert writer.seen == []                # the bad row was never sent
+
+
+from sqloutbox.cli import cmd_dead_letter, cmd_skip
+
+
+def _write_toml(tmp_path: Path, db_dir: Path) -> Path:
+    toml = tmp_path / "outbox.toml"
+    toml.write_text(
+        f'[app.t]\n'
+        f'db_dir = "{db_dir.as_posix()}"\n\n'
+        f'[app.t.db.primary]\n'
+        f'writer_class = "sqloutbox.cli:TursoWriter"\n'
+        f'tables = ["evt"]\n\n'
+        f'[app.t.db.primary.connection]\n'
+        f'db_url = "http://x"\n'
+        f'db_token = "x"\n'
+    )
+    return toml
+
+
+def test_cli_dead_letter_list_show_replay(tmp_path: Path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    ob = Outbox(db_path=data / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]", source="prod")
+    ob.dead_letter(seq, reason="max_attempts")
+    toml = _write_toml(tmp_path, data)
+
+    # list
+    cmd_dead_letter(toml, action="list", namespace=None, seq=None)
+    out = capsys.readouterr().out
+    assert "evt" in out and str(seq) in out and "max_attempts" in out
+
+    # show
+    cmd_dead_letter(toml, action="show", namespace="evt", seq=seq)
+    out = capsys.readouterr().out
+    assert "INSERT INTO evt" in out and "[1]" in out
+
+    # replay — row leaves dead_log and re-enters the queue
+    cmd_dead_letter(toml, action="replay", namespace="evt", seq=seq)
+    capsys.readouterr()
+    assert Outbox(db_path=data / "evt.db", namespace="evt").list_dead() == []
+    assert Outbox(db_path=data / "evt.db", namespace="evt").pending_count() == 1
+
+
+def test_cli_skip_moves_head(tmp_path: Path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    ob = Outbox(db_path=data / "evt.db", namespace="evt")
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    toml = _write_toml(tmp_path, data)
+
+    cmd_skip(toml, namespace="evt", seq=seq)
+    capsys.readouterr()
+    ob2 = Outbox(db_path=data / "evt.db", namespace="evt")
+    assert ob2.pending_count() == 0
+    dead = ob2.list_dead()
+    assert len(dead) == 1 and dead[0].reason == "manual_skip"

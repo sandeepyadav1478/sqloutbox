@@ -53,6 +53,7 @@ from typing import Any, Protocol, runtime_checkable
 from sqloutbox._outbox import Outbox
 from sqloutbox._verify import VerifyResult, verify_all
 from sqloutbox.config import OutboxConfig, TargetConfig
+from sqloutbox.exceptions import UnsupportedStatementError
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,98 @@ class OutboxWriter(Protocol):
 # ── SQL helpers ──────────────────────────────────────────────────────────────
 
 
+def _mask_string_literals(sql: str) -> str:
+    """Return ``sql`` with the *contents* of quoted string literals blanked.
+
+    Replaces every character inside a single- or double-quoted literal with a
+    space, leaving the quote characters and all structural SQL outside the
+    literals intact. SQL's doubled-quote escape ('' inside a '…' literal, and
+    "" inside a "…") is handled — a doubled quote does NOT close the literal.
+
+    The result (the "skeleton") has the SAME LENGTH and SAME structural-char
+    positions as the input, so index/count scans (find, rfind, count('?'))
+    on the skeleton map 1:1 back onto the original string — but a '?' / ')' /
+    'WHERE' that lived inside a literal is now a space and cannot mislead them.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    quote = ""  # "" when outside a literal; "'" or '"' when inside one
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                # A doubled quote ('' or "") is an escape — stays inside the literal.
+                if i + 1 < n and sql[i + 1] == quote:
+                    out.append(quote)
+                    out.append(quote)
+                    i += 2
+                    continue
+                out.append(quote)   # closing quote
+                quote = ""
+                i += 1
+                continue
+            out.append(" ")          # blank the literal content
+            i += 1
+            continue
+        if ch == "'" or ch == '"':
+            quote = ch
+            out.append(ch)           # opening quote
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _assert_supported(sql: str, masked: str) -> None:
+    """Raise UnsupportedStatementError unless ``sql`` is a safe INSERT/UPDATE.
+
+    ``masked`` is ``_mask_string_literals(sql)`` — structural scanning runs on
+    it so a ')' / '?' / WHERE inside a string literal cannot fool the checks.
+
+    Supported (and ONLY these):
+        INSERT INTO t (cols) VALUES (?, …)     -- single-row, explicit columns
+        UPDATE t SET c=? [, …] WHERE …          -- at least one real SET arg
+    """
+    upper = masked.upper().strip()
+
+    if upper.startswith("INSERT"):
+        vi = upper.find(") VALUES")
+        if vi == -1:
+            raise UnsupportedStatementError(
+                f"INSERT must be single-row 'INSERT INTO t (cols) VALUES (...)'; "
+                f"got: {sql!r}"
+            )
+        after = upper[vi + len(") VALUES"):]
+        # Multi-row VALUES: a second '(' opens after the first VALUES group closes.
+        first_close = after.find(")")
+        if first_close != -1 and "(" in after[first_close + 1:]:
+            raise UnsupportedStatementError(
+                f"multi-row VALUES is not supported (one row per statement); "
+                f"got: {sql!r}"
+            )
+        return
+
+    if upper.startswith("UPDATE"):
+        where_idx = upper.find(" WHERE ")
+        set_part = masked[:where_idx] if where_idx != -1 else masked
+        # The transform inserts ', outbox_seq = ?' after the real SET args. If
+        # the skeleton has no real '?' in SET, the original only had a literal
+        # '?' — ambiguous; reject rather than emit wrong SQL.
+        if set_part.count("?") < 1:
+            raise UnsupportedStatementError(
+                f"UPDATE SET clause has no bind placeholder (a '?' inside a "
+                f"string literal does not count); got: {sql!r}"
+            )
+        return
+
+    raise UnsupportedStatementError(
+        f"only single-row INSERT … VALUES (…) and UPDATE … SET …=? are "
+        f"supported by inject_outbox_seq; got: {sql!r}"
+    )
+
+
 def inject_outbox_seq(
     sql: str, args: list[Any], outbox_seq: int,
 ) -> tuple[str, list[Any]]:
@@ -141,38 +234,41 @@ def inject_outbox_seq(
     (modified_sql, modified_args)
     """
     s = sql.strip()
-    upper = s.upper()
+    # Mask string-literal contents so a ')' / '?' / WHERE inside a literal cannot
+    # mislead the structural scans below, then reject any unsupported shape.
+    masked = _mask_string_literals(s)
+    _assert_supported(s, masked)
+
+    upper = masked.upper()
 
     if upper.startswith("INSERT"):
-        # Convert INSERT INTO → INSERT OR IGNORE INTO
+        # Convert INSERT INTO → INSERT OR IGNORE INTO (operate on the original s;
+        # the prefix length is identical in s and the skeleton).
         if upper.startswith("INSERT INTO"):
             s = "INSERT OR IGNORE INTO" + s[len("INSERT INTO"):]
-        # Insert outbox_seq column before ) VALUES
-        vi = s.upper().find(") VALUES")
-        if vi != -1:
-            s = s[:vi] + ", outbox_seq" + s[vi:]
-        # Insert ? placeholder before last )
-        lp = s.rfind(")")
-        if lp != -1:
-            s = s[:lp] + ", ?" + s[lp:]
+            masked = "INSERT OR IGNORE INTO" + masked[len("INSERT INTO"):]
+        upper = masked.upper()
+        # Insert outbox_seq column before ') VALUES' (index from the skeleton).
+        vi = upper.find(") VALUES")
+        s = s[:vi] + ", outbox_seq" + s[vi:]
+        masked = masked[:vi] + ", outbox_seq" + masked[vi:]
+        # Insert '?' placeholder before the LAST ')' of the VALUES group. On the
+        # skeleton the only ')' chars are structural, so rfind is now safe.
+        lp = masked.rfind(")")
+        s = s[:lp] + ", ?" + s[lp:]
         return s, list(args) + [outbox_seq]
 
-    if upper.startswith("UPDATE"):
-        where_idx = upper.find(" WHERE ")
-        if where_idx != -1:
-            # Count ? placeholders in SET clause (before WHERE)
-            set_part = s[:where_idx]
-            n_set_args = set_part.count("?")
-            # Inject outbox_seq=? before WHERE
-            s = s[:where_idx] + ", outbox_seq = ?" + s[where_idx:]
-            new_args = list(args)
-            new_args.insert(n_set_args, outbox_seq)
-            return s, new_args
-        # No WHERE clause — append to SET
-        s = s + ", outbox_seq = ?"
-        return s, list(args) + [outbox_seq]
-
-    # Unknown statement type — return unchanged
+    # UPDATE (the only other shape _assert_supported lets through).
+    where_idx = upper.find(" WHERE ")
+    if where_idx != -1:
+        # Count real '?' placeholders in the SET clause via the skeleton.
+        n_set_args = masked[:where_idx].count("?")
+        s = s[:where_idx] + ", outbox_seq = ?" + s[where_idx:]
+        new_args = list(args)
+        new_args.insert(n_set_args, outbox_seq)
+        return s, new_args
+    # No WHERE — append outbox_seq to the SET clause.
+    s = s + ", outbox_seq = ?"
     return s, list(args) + [outbox_seq]
 
 

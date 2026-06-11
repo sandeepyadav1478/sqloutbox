@@ -123,3 +123,107 @@ def test_verify_db_path_existing_db_unchanged(tmp_path: Path):
     assert _journal_mode(db) == jm_before
     assert sorted(p.name for p in tmp_path.iterdir()) == files_before
     assert os.path.getmtime(db) == mtime_before
+
+
+# ── Forked-chain migration ──────────────────────────────────────────────────
+
+
+def _build_forked_db(db_path: Path) -> None:
+    """Hand-build an outbox DB with two rows sharing the same prev_seq (a fork).
+
+    We create the queue table WITHOUT the UNIQUE constraint / index so the fork
+    can be inserted, then leave the file for open_write_conn to migrate — that
+    is exactly the upgrade path that must fail safely.
+
+    We ALSO create an (empty) ``outbox_sync_log`` table. A real forked
+    production DB always has it — ``open_write_conn`` creates ``outbox_sync_log``
+    (line ~90) BEFORE the UNIQUE-index creation that crashes (line ~92), so any
+    DB old enough to fork already carries the sync_log table. Without it, the
+    read-only ``verify_db_path`` (which SELECTs from ``outbox_sync_log``) would
+    raise ``OperationalError: no such table`` instead of REPORTING the fork —
+    breaking ``test_forked_db_read_only_verify_reports_without_crashing``.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE outbox_queue ("
+        "  seq        INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  created_at TEXT    NOT NULL,"
+        "  namespace  TEXT    NOT NULL,"
+        "  source     TEXT    NOT NULL DEFAULT '',"
+        "  tag        TEXT    NOT NULL,"
+        "  payload    TEXT    NOT NULL,"
+        "  prev_seq   INTEGER,"
+        "  synced     INTEGER NOT NULL DEFAULT 0"
+        ")"
+    )
+    # Mirror the real schema: open_write_conn creates outbox_sync_log before the
+    # UNIQUE-index migration, so a real forked DB always has this table.
+    conn.execute(
+        "CREATE TABLE outbox_sync_log ("
+        "  seq       INTEGER PRIMARY KEY,"
+        "  namespace TEXT    NOT NULL,"
+        "  synced_at TEXT    NOT NULL"
+        ")"
+    )
+    # seq=1 head (prev_seq NULL), then TWO rows both pointing at seq=1 → fork.
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (1, '2026-01-01T00:00:00+00:00', 'evt', 't', 'a', NULL)")
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (2, '2026-01-01T00:00:01+00:00', 'evt', 't', 'b', 1)")
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (3, '2026-01-01T00:00:02+00:00', 'evt', 't', 'c', 1)")
+    conn.commit()
+    conn.close()
+
+
+def test_forked_db_open_write_conn_raises_chain_integrity_error(tmp_path: Path):
+    """open_write_conn on a forked DB raises typed ChainIntegrityError, not IntegrityError."""
+    from sqloutbox._schema import open_write_conn
+    from sqloutbox.exceptions import ChainIntegrityError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    with pytest.raises(ChainIntegrityError) as ei:
+        open_write_conn(db)
+    msg = str(ei.value)
+    assert "prev_seq" in msg
+    assert "1" in msg            # names the duplicated prev_seq value
+    assert "recover" in msg.lower() or "skip" in msg.lower()  # recovery pointer
+
+
+def test_forked_db_outbox_init_raises_chain_integrity_error(tmp_path: Path):
+    """Outbox.__init__ (producer hot path) raises ChainIntegrityError, not a bare crash."""
+    from sqloutbox.exceptions import ChainIntegrityError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    with pytest.raises(ChainIntegrityError):
+        Outbox(db_path=db, namespace="evt")
+
+
+def test_forked_db_chain_integrity_error_is_sqloutbox_error(tmp_path: Path):
+    """ChainIntegrityError is part of the SqloutboxError hierarchy (catchable broadly)."""
+    from sqloutbox._schema import open_write_conn
+    from sqloutbox.exceptions import ChainIntegrityError, SqloutboxError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+    with pytest.raises(SqloutboxError):
+        open_write_conn(db)
+    assert issubclass(ChainIntegrityError, SqloutboxError)
+
+
+def test_forked_db_read_only_verify_reports_without_crashing(tmp_path: Path):
+    """Read-only verify OPENS and REPORTS the fork (does not raise) — diagnostic stays usable."""
+    from sqloutbox._verify import verify_db_path
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    # No exception — verify must remain usable on a DB that crashes the writer.
+    result = verify_db_path(db, namespace="evt")
+    assert result.ok is False
+    assert result.chain_ok is False
+    assert any("fork" in e.lower() for e in result.errors)

@@ -116,6 +116,56 @@ _IDX_SYNC_LOG = (
 
 # ── Connection helpers ────────────────────────────────────────────────────────
 
+def _find_forked_prev_seqs(conn: sqlite3.Connection) -> list[tuple[int, int]]:
+    """Return [(prev_seq, count), …] for every prev_seq shared by >1 row.
+
+    A non-NULL prev_seq pointed at by two or more rows is a forked chain —
+    it violates the singly-linked invariant and is why CREATE UNIQUE INDEX
+    fails. Used to build a precise, actionable ChainIntegrityError message.
+    """
+    return conn.execute(
+        "SELECT prev_seq, COUNT(*) c FROM outbox_queue "
+        "WHERE prev_seq IS NOT NULL "
+        "GROUP BY prev_seq HAVING c > 1 "
+        "ORDER BY prev_seq"
+    ).fetchall()
+
+
+def _create_prev_seq_index_guarded(
+    conn: sqlite3.Connection, index_sql: str, db_path: Path
+) -> None:
+    """Run a ``CREATE UNIQUE INDEX … ON outbox_queue (prev_seq)`` statement.
+
+    On a forked-chain DB (two rows sharing a non-NULL prev_seq) the UNIQUE
+    index creation raises ``sqlite3.IntegrityError``. Unguarded, that bare
+    error crashes ``Outbox.__init__`` — the producer HOT PATH. Convert it to a
+    typed ``ChainIntegrityError`` (spec §6.2, F006/F029) that names the
+    duplicate rows and points at the recovery tool, so the failure is
+    diagnosable. ``ChainIntegrityError`` is owned by Plan 3 (lazy import inside
+    the except to keep ``_schema.py`` import-order-independent — same pattern as
+    ``_outbox.verify_full``).
+    """
+    try:
+        conn.execute(index_sql)
+    except sqlite3.IntegrityError as exc:
+        from sqloutbox.exceptions import ChainIntegrityError
+
+        forks = _find_forked_prev_seqs(conn)
+        try:
+            conn.close()  # do not leak the half-migrated write connection
+        except Exception:
+            pass
+        fork_desc = ", ".join(f"prev_seq={p} (×{c})" for p, c in forks) or "unknown"
+        raise ChainIntegrityError(
+            f"forked chain in {db_path}: {fork_desc} — two or more rows share a "
+            f"prev_seq, violating the singly-linked invariant. The UNIQUE index "
+            f"on prev_seq cannot be created. Recover with: inspect read-only via "
+            f"`sqloutbox verify --db-dir <dir>`, then skip/replay the offending "
+            f"row(s) with the dead-letter CLI (`sqloutbox skip --namespace <ns> "
+            f"--seq <S>`) so each prev_seq is pointed at by exactly one row."
+        ) from exc
+
+
 def open_write_conn(db_path: Path) -> sqlite3.Connection:
     """Open (or create) the DB and apply schema. Returns a persistent connection.
 
@@ -132,7 +182,11 @@ def open_write_conn(db_path: Path) -> sqlite3.Connection:
     conn.execute(_CREATE_QUEUE)
     conn.execute(_CREATE_SYNC_LOG)
     conn.execute(_IDX_WORKER)
-    conn.execute(_IDX_PREV)
+    # GUARDED (spec §6.2): _IDX_PREV is a UNIQUE index on prev_seq — on a forked
+    # chain it raises IntegrityError FIRST, before the migration below. Convert
+    # to ChainIntegrityError so Outbox.__init__ (the producer hot path) never
+    # dies with a bare IntegrityError.
+    _create_prev_seq_index_guarded(conn, _IDX_PREV, db_path)
     conn.execute(_IDX_SYNC_LOG)
     # Idempotent migration: add `source` column to DBs created before it existed.
     try:
@@ -141,7 +195,10 @@ def open_write_conn(db_path: Path) -> sqlite3.Connection:
         pass  # column already exists — OperationalError, safe to ignore
     # Idempotent migration: enforce UNIQUE on prev_seq for existing DBs.
     # CREATE UNIQUE INDEX IF NOT EXISTS is a no-op when the index already exists.
-    conn.execute(_MIGRATE_PREV_SEQ_UNIQUE)
+    # GUARDED (spec §6.2, F006/F029): same forked-chain conversion as _IDX_PREV
+    # above — kept guarded for defense in depth (e.g. if _IDX_PREV were ever
+    # made non-UNIQUE, this migration would then be the one that raises).
+    _create_prev_seq_index_guarded(conn, _MIGRATE_PREV_SEQ_UNIQUE, db_path)
     # Idempotent migrations: retry/backoff tracking columns (wrapped — a second
     # open raises "duplicate column" which is safe to ignore, exactly like source).
     for _stmt in (

@@ -400,3 +400,95 @@ async def test_already_applied_advances_head(tmp_path: Path):
     # Head advanced (treated as delivered); nothing dead-lettered.
     assert ob.pending_count() == 0
     assert ob.list_dead() == []
+
+
+from datetime import datetime, timedelta, timezone
+
+
+def _set_head_backoff(ob: Outbox, seq: int, attempts: int, last_attempt_at: str):
+    conn = ob._write_conn
+    conn.execute(
+        "UPDATE outbox_queue SET attempts=?, last_attempt_at=?, "
+        "last_error='boom', last_error_class='TRANSIENT' WHERE seq=?",
+        (attempts, last_attempt_at, seq),
+    )
+    conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_backoff_gate_suppresses_table_before_eligible(tmp_path: Path):
+    """A head in backoff is NOT re-sent before next_eligible, even with max_wait=0."""
+    writer = _SeqWriter([])  # would record a stmt if the gate let the table through
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    # attempts=3 → delay = 2^3 = 8 min; last attempt was 1 minute ago → NOT eligible.
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    _set_head_backoff(ob, s1, attempts=3, last_attempt_at=recent)
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.15)   # several cycles
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Suppressed: writer never saw the data row.
+    assert writer.seen == []
+    assert ob.pending_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_backoff_gate_allows_after_elapsed(tmp_path: Path):
+    """Once next_eligible has passed, the head is retried."""
+    writer = _SeqWriter([{"ok": True, "rows_affected": 1}])
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    # attempts=1 → delay = 2 min; last attempt 10 min ago → ELIGIBLE.
+    old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    _set_head_backoff(ob, s1, attempts=1, last_attempt_at=old)
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ob.pending_count() == 0  # retried and delivered
+
+
+@pytest.mark.asyncio
+async def test_stuck_head_fetches_only_head(tmp_path: Path):
+    """While a head is stuck (attempts>0) and eligible, only ONE row is fetched."""
+    sent_batches = []
+
+    class _Capture:
+        async def write_batch(self, stmts):
+            sent_batches.append(list(stmts))
+            return [{"ok": False, "error": "connection reset"} for _ in stmts]
+
+    writer = _Capture()
+    svc, cfg = _service(tmp_path, writer)
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    s2 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+    s3 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[3]")
+    # Head stuck but eligible (attempts=1, last attempt long ago).
+    old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    _set_head_backoff(ob, s1, attempts=1, last_attempt_at=old)
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.15)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # Every batch the writer saw contained exactly ONE row (head-only fetch).
+    assert sent_batches, "writer should have been called at least once"
+    assert all(len(b) == 1 for b in sent_batches)

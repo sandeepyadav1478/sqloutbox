@@ -47,6 +47,7 @@ import json
 import logging
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Any, Protocol, runtime_checkable
 
@@ -310,6 +311,28 @@ def classify_write_error(error: str | None) -> str:
         return "DETERMINISTIC"
 
     return "UNKNOWN"
+
+
+def _backoff_eligible(attempts: int, last_attempt_at: str | None, cap_minutes: int) -> bool:
+    """Return True if a stuck head is eligible to retry now (§3.2 backoff gate).
+
+    delay = min(2^attempts, cap) minutes after last_attempt_at (UTC ISO).
+    A missing/unparseable/future last_attempt_at → eligible now (never stall
+    forever — fail open, the row is retried rather than stranded).
+    """
+    if attempts <= 0 or not last_attempt_at:
+        return True
+    try:
+        last = datetime.fromisoformat(last_attempt_at)
+    except ValueError:
+        return True
+    delay = timedelta(minutes=min(2 ** attempts, cap_minutes))
+    next_eligible = last + delay
+    now = datetime.now(timezone.utc)
+    # last_attempt_at in the future (clock skew) → treat as eligible.
+    if next_eligible <= now or last > now:
+        return True
+    return False
 
 
 # ── Sync service ─────────────────────────────────────────────────────────────
@@ -705,6 +728,30 @@ class OutboxSyncService:
                     if pending == 0:
                         continue
 
+                    # ── WS-1 backoff gate ────────────────────────────────
+                    # A stuck head (attempts>0) is suppressed until its
+                    # min(2^attempts, cap) backoff has elapsed — regardless of
+                    # the threshold / max_wait triggers below. While stuck we
+                    # fetch ONLY the head (limit=1) so nothing behind it can
+                    # leapfrog (the no-skip / head-of-line invariant, §3.2).
+                    cap_minutes = getattr(
+                        self._config, "backoff_cap_minutes", 64,
+                    )
+                    head = outbox.peek_head()
+                    head_stuck = bool(head and head.attempts > 0)
+                    if head_stuck:
+                        if not _backoff_eligible(
+                            head.attempts, head.last_attempt_at, cap_minutes,
+                        ):
+                            if logger.isEnabledFor(_VERBOSE):
+                                logger.log(
+                                    _VERBOSE,
+                                    "[outbox_sync] backoff: table='%s' head seq=%d "
+                                    "attempts=%d not yet eligible — skipping",
+                                    table, head.seq, head.attempts,
+                                )
+                            continue
+
                     elapsed = now - last_flush.get(table, 0.0)
 
                     # ── Round-robin decision ─────────────────────────────
@@ -719,7 +766,12 @@ class OutboxSyncService:
                         continue
 
                     # ── Table is ready — fetch rows ──────────────────────
-                    rows = await asyncio.to_thread(outbox.fetch_unsynced)
+                    # Head-of-line hold: while the head is stuck, fetch ONLY it
+                    # (limit=1). A healthy namespace fetches a normal batch.
+                    if head_stuck:
+                        rows = await asyncio.to_thread(outbox.fetch_unsynced, 1)
+                    else:
+                        rows = await asyncio.to_thread(outbox.fetch_unsynced)
                     if not rows:
                         continue
 

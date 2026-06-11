@@ -205,3 +205,37 @@ async def test_runner_clean_stop_does_not_raise(monkeypatch, tmp_path: Path):
     handlers[_signal.SIGINT]()           # fire the stop handler the runner set
     # Completes WITHOUT SystemExit (clean-stop path), within the timeout.
     await asyncio.wait_for(runner_task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_poison_and_healthy_coexist(tmp_path: Path):
+    writer = _CollectingWriter()
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(TargetConfig(name="primary", tables=("poison", "healthy"),
+                              inject_outbox_seq=False),),
+        flush_interval=0.01,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        auto_schema=False,
+    )
+    svc = OutboxSyncService(config=cfg, writers={"primary": writer})
+
+    _enqueue_raw(tmp_path / "poison.db", "poison",
+                 "INSERT INTO poison (a) VALUES (?)", b"}{ not json")
+    Outbox(db_path=tmp_path / "healthy.db", namespace="healthy").enqueue(
+        "INSERT INTO healthy (a) VALUES (?)", json.dumps([7]).encode()
+    )
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.25)
+    assert not task.done()                       # daemon still alive
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    delivered = [sql for sql, _ in writer.seen]
+    assert any("healthy" in s for s in delivered)
+    assert not any("poison" in s for s in delivered)

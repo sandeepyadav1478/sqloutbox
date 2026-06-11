@@ -112,6 +112,37 @@ class TargetConfig:
     # Built by the TOML parser from inline table entries:
     #   tables = [{ name = "raw_log", retain_log_days = 7 }]
     table_retain_overrides: tuple[tuple[str, int], ...] = ()
+    # WS-3 safety-rail fields (mirror OutboxConfig; opt-in / opt-out):
+    #   max_attempts:    D1 auto-dead-letter threshold (None = plateau-forever)
+    #   max_pending:     D2 opt-in backpressure cap (None = unbounded)
+    #   max_batch_bytes: optional per-target memory bound (None = unbounded)
+    max_attempts: int | None = 10
+    max_pending: int | None = None
+    max_batch_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate fields at construction (frozen dataclass — raise before use).
+
+        Raises ConfigError(field, value, reason) on the first violation so a
+        misconfiguration fails loudly at startup, not in production.
+        """
+        from sqloutbox.exceptions import ConfigError
+
+        if self.batch_size < 1:
+            raise ConfigError("batch_size", self.batch_size, "must be >= 1")
+        if self.retain_log_days < 0:
+            raise ConfigError("retain_log_days", self.retain_log_days,
+                              "must be >= 0 (negative computes a future cutoff)")
+        if self.max_pending is not None and self.max_pending < 1:
+            raise ConfigError("max_pending", self.max_pending,
+                              "must be None or >= 1")
+        if self.max_attempts is not None and self.max_attempts < 1:
+            raise ConfigError("max_attempts", self.max_attempts,
+                              "must be None or >= 1")
+        for _name, _days in self.table_retain_overrides:
+            if _days < 0:
+                raise ConfigError("retain_log_days", _days,
+                                  f"per-table override for {_name!r} must be >= 0")
 
     def should_inject_seq(self, table: str) -> bool:
         """Check whether a specific table should get outbox_seq injection."""
@@ -190,6 +221,45 @@ class OutboxConfig:
     auto_schema: bool = True
     cleanup_every: int = 500
     retain_log_days: int = 30
+    # WS-3 safety-rail fields (spec §8):
+    #   max_attempts:    D1 auto-dead-letter threshold (None = plateau-forever)
+    #   max_pending:     D2 opt-in backpressure cap (None = unbounded, default)
+    #   max_batch_bytes: optional memory bound (None = unbounded)
+    max_attempts: int | None = 10
+    max_pending: int | None = None
+    max_batch_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate tuning fields at construction (frozen dataclass).
+
+        Raises ConfigError(field, value, reason) on the first violation — a
+        clear, field-named error instead of a modulo-by-zero or future-cutoff
+        surprise in production.
+        """
+        from sqloutbox.exceptions import ConfigError
+
+        if self.batch_size < 1:
+            raise ConfigError("batch_size", self.batch_size, "must be >= 1")
+        if self.flush_interval <= 0:
+            raise ConfigError("flush_interval", self.flush_interval, "must be > 0")
+        if self.table_flush_threshold < 1:
+            raise ConfigError("table_flush_threshold", self.table_flush_threshold,
+                              "must be >= 1")
+        if self.table_max_wait < 0:
+            raise ConfigError("table_max_wait", self.table_max_wait, "must be >= 0")
+        if self.cleanup_every < 1:
+            raise ConfigError("cleanup_every", self.cleanup_every,
+                              "must be >= 1 (prevents modulo-by-zero / never-prune)")
+        if self.retain_log_days < 0:
+            raise ConfigError("retain_log_days", self.retain_log_days,
+                              "must be >= 0 (negative computes a future cutoff "
+                              "→ would wipe the audit log)")
+        if self.max_pending is not None and self.max_pending < 1:
+            raise ConfigError("max_pending", self.max_pending,
+                              "must be None or >= 1")
+        if self.max_attempts is not None and self.max_attempts < 1:
+            raise ConfigError("max_attempts", self.max_attempts,
+                              "must be None or >= 1")
 
     def tables_for_target(self, name: str) -> tuple[str, ...]:
         """Return table names routed to the named target."""

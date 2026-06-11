@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from collections import defaultdict
 from typing import Any, Protocol, runtime_checkable
@@ -563,6 +564,7 @@ class OutboxSyncService:
                 flushed_tables: list[str] = []
 
                 for table, outbox in outboxes.items():
+                  try:
                     pending = outbox.pending_count()
                     if pending == 0:
                         continue
@@ -624,6 +626,22 @@ class OutboxSyncService:
                         stmt_info.append((table, row.seq))
 
                     flushed_tables.append(table)
+                  except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+                    # L2: isolate a corrupt/locked namespace. Skip it THIS cycle;
+                    # sibling tables keep draining. (Transient lock → retries next
+                    # cycle; structural corruption → keeps logging until repaired.)
+                    logger.error(
+                        "[outbox_sync] table='%s' skipped this cycle (db error): %s",
+                        table, exc,
+                    )
+                    continue
+                  except Exception as exc:
+                    # Any other per-table fault must not escape the loop either.
+                    logger.exception(
+                        "[outbox_sync] table='%s' skipped this cycle (unexpected): %s",
+                        table, exc,
+                    )
+                    continue
 
                 if all_stmts:
                     any_flushed = True

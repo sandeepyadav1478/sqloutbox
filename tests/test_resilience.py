@@ -93,3 +93,47 @@ async def test_undecodable_row_does_not_kill_loop(tmp_path: Path):
     # The loop survived (task did not die on its own before cancel) and the
     # poison row was NOT delivered to the writer.
     assert writer.seen == []
+
+
+class _BoomOutbox:
+    """Stand-in outbox whose reads always raise — simulates a corrupt file."""
+    def pending_count(self):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+    def fetch_unsynced(self):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+
+@pytest.mark.asyncio
+async def test_corrupt_namespace_isolated_siblings_drain(tmp_path: Path):
+    writer = _CollectingWriter()
+    # Two tables on one target: 'bad' is corrupt, 'good' is healthy.
+    # inject_outbox_seq=False + auto_schema=False keeps startup write_batch
+    # calls out of writer.seen (see _make_service note).
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(TargetConfig(name="primary", tables=("bad", "good"),
+                              inject_outbox_seq=False),),
+        flush_interval=0.01,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        auto_schema=False,
+    )
+    svc = OutboxSyncService(config=cfg, writers={"primary": writer})
+
+    # Seed a healthy row in 'good'.
+    Outbox(db_path=tmp_path / "good.db", namespace="good").enqueue(
+        "INSERT INTO good (a) VALUES (?)", json.dumps([1]).encode()
+    )
+    # Replace the 'bad' outbox with one that raises on every read.
+    svc._target_outboxes["primary"]["bad"] = _BoomOutbox()
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    # 'good' was delivered despite 'bad' raising every cycle.
+    assert any("good" in sql for sql, _ in writer.seen)

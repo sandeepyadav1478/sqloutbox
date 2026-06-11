@@ -205,3 +205,13 @@ async def test_broken_writer_isolated_siblings_drain(tmp_path: Path):
 
     # Healthy sibling delivered despite the broken target raising every cycle.
     assert any("good" in s for s, _ in good.delivered)
+
+
+def test_acquire_lock_noop_when_fcntl_unavailable(tmp_path: Path, monkeypatch):
+    """On a platform without fcntl, the lock is a no-op (returns None) and WARNs —
+    single-drain is not enforced, matching the documented Windows behavior."""
+    monkeypatch.setattr(_runner, "fcntl", None)
+    handle = _runner.acquire_single_drain_lock(tmp_path)
+    assert handle is None
+    # release on None is a safe no-op
+    _runner.release_single_drain_lock(handle)

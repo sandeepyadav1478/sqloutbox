@@ -227,3 +227,82 @@ def test_forked_db_read_only_verify_reports_without_crashing(tmp_path: Path):
     assert result.ok is False
     assert result.chain_ok is False
     assert any("fork" in e.lower() for e in result.errors)
+
+
+# ── Producer-side seed (persisted high-water mark, mechanism (a)) ────────────
+
+
+def test_hwm_recorded_on_enqueue(tmp_path: Path):
+    """Each enqueue persists a per-namespace high-water mark in outbox_hwm."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    seqs = _enqueue_n(ob, 3)
+    assert ob._persisted_hwm() == max(seqs)
+
+
+def test_seed_sequence_persists_hwm(tmp_path: Path):
+    """The drain's seed_sequence (remote max) is persisted as a floor."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.seed_sequence(5000)
+    assert ob._persisted_hwm() == 5000
+
+
+def test_fresh_host_lazy_seed_from_persisted_hwm(tmp_path: Path):
+    """A NEW Outbox on the same file lazily seeds its counter from the persisted hwm.
+
+    Simulates: drain ran seed_sequence(remote_max) once; later the producer
+    process restarts and constructs a fresh Outbox — it must pick up the floor
+    and NOT restart numbering low.
+    """
+    db = tmp_path / "events.db"
+    # First instance learns the remote max (e.g. via the drain's _seed_from_remote).
+    first = Outbox(db_path=db, namespace="evt")
+    first.seed_sequence(10_000)
+    first._write_conn.close()
+
+    # Producer restarts: a brand-new Outbox on the same file.
+    producer = Outbox(db_path=db, namespace="evt")
+    seq = producer.enqueue("INSERT INTO evt (id) VALUES (?)", b"[1]")
+    assert seq is not None
+    assert seq > 10_000, f"producer must start above persisted hwm, got {seq}"
+
+
+def test_fresh_host_populated_remote_no_collision(tmp_path: Path):
+    """End-to-end mechanism (a): fresh local file + known remote max → no colliding seqs.
+
+    Reproduces the F004 collision scenario: the local file is fresh (counter
+    would start at 1), but we know the remote already holds outbox_seq 1..200.
+    After recording that high-water mark, the producer's enqueues all land
+    ABOVE 200, so INSERT OR IGNORE on the remote can never silently drop them.
+    """
+    db = tmp_path / "events.db"
+    remote_max = 200
+
+    # Producer-side seed from the persisted high-water mark (mechanism (a)):
+    # in production this floor is established by the drain's seed_sequence(remote_max)
+    # OR by a prior run; here we set it explicitly to model "populated remote".
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(remote_max)
+    # A fresh Outbox constructed afterwards lazily seeds from the persisted hwm.
+    ob2 = Outbox(db_path=db, namespace="evt")
+
+    seqs = [ob2.enqueue("INSERT INTO evt (id) VALUES (?)", f"[{i}]".encode())
+            for i in range(5)]
+    assert all(s is not None for s in seqs)
+    assert all(s > remote_max for s in seqs), \
+        f"all producer seqs must exceed remote max {remote_max}; got {seqs}"
+    # No value in 1..remote_max is reused → INSERT OR IGNORE cannot drop them.
+    assert not set(seqs) & set(range(1, remote_max + 1))
+
+
+def test_hwm_does_not_break_chain_integrity(tmp_path: Path):
+    """Persisted-hwm seeding leaves the singly-linked chain verifiable."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(9000)
+    ob2 = Outbox(db_path=db, namespace="evt")
+    ob2.enqueue_batch([("t", b"a"), ("t", b"b"), ("t", b"c")])
+    rows = ob2.fetch_unsynced()
+    ok, gaps = ob2.verify_chain(rows)
+    assert ok is True, f"chain must stay intact after hwm seed; gaps={gaps}"

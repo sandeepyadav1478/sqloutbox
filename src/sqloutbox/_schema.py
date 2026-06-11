@@ -95,6 +95,18 @@ CREATE TABLE IF NOT EXISTS outbox_sync_log (
 )
 """
 
+# Per-namespace producer-side high-water mark (spec §6.3, mechanism (a)).
+# Persists the highest seq ever ASSIGNED for a namespace (or the remote MAX
+# learned by the drain). On a fresh host with a populated remote, the producer
+# reads this floor at construction and seeds its local AUTOINCREMENT above it,
+# so INSERT OR IGNORE on the remote can never silently drop a colliding seq.
+_CREATE_HWM = """
+CREATE TABLE IF NOT EXISTS outbox_hwm (
+    namespace TEXT    NOT NULL PRIMARY KEY,
+    hwm       INTEGER NOT NULL
+)
+"""
+
 # Covers the primary worker query: unsynced rows per namespace in order
 _IDX_WORKER = (
     "CREATE INDEX IF NOT EXISTS idx_outbox_worker "
@@ -181,6 +193,7 @@ def open_write_conn(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(_CREATE_QUEUE)
     conn.execute(_CREATE_SYNC_LOG)
+    conn.execute(_CREATE_HWM)
     conn.execute(_IDX_WORKER)
     # GUARDED (spec §6.2): _IDX_PREV is a UNIQUE index on prev_seq — on a forked
     # chain it raises IntegrityError FIRST, before the migration below. Convert

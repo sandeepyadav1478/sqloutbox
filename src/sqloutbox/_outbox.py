@@ -76,6 +76,11 @@ class Outbox:
         self.max_pending     = max_pending
         # Persistent write connection — used exclusively by enqueue() from one thread
         self._write_conn = open_write_conn(db_path)
+        # Producer-side seed (spec §6.3, mechanism (a)): on a fresh host with a
+        # populated remote, lazily advance the local AUTOINCREMENT above the
+        # persisted high-water mark BEFORE the first enqueue, so new seqs never
+        # collide with remote outbox_seq values (which INSERT OR IGNORE drops).
+        self._seed_from_hwm()
 
     # ── Hot path ────────────────────────────────────────────────────────────
 
@@ -130,6 +135,9 @@ class Outbox:
             assert cur.lastrowid is not None
             new_seq: int = cur.lastrowid
             self._write_conn.commit()
+            # Persist the high-water mark so a fresh producer on this host
+            # (mechanism (a)) re-seeds above it after a restart.
+            self.record_hwm(new_seq)
             return new_seq
         except Exception as exc:
             try:
@@ -210,6 +218,10 @@ class Outbox:
                 rows_data,
             )
             self._write_conn.commit()   # ONE commit for the entire batch
+            last_seq = start_seq + len(items) - 1
+            # Persist the high-water mark (highest seq in this batch) so a fresh
+            # producer on this host re-seeds above it after a restart.
+            self.record_hwm(last_seq)
             return list(range(start_seq, start_seq + len(items)))
         except Exception as exc:
             try:
@@ -596,11 +608,61 @@ class Outbox:
                 [min_seq],
             )
         self._write_conn.commit()
+        # Persist the remote max as the durable floor so a producer restart on
+        # this host re-seeds from it (mechanism (a)) even before the drain runs.
+        self.record_hwm(min_seq)
         logger.info(
             "sqloutbox[%s]: seeded sequence from %d → %d (remote max)",
             self.namespace, current, min_seq,
         )
         return True
+
+    def record_hwm(self, seq: int) -> None:
+        """Persist ``seq`` as this namespace's high-water mark (idempotent MAX).
+
+        Stores ``MAX(existing_hwm, seq)`` in ``outbox_hwm``. Called after a
+        successful enqueue (the assigned seq) and by ``seed_sequence`` (the
+        learned remote max). Cheap upsert; never raises — a failure here must
+        not break the hot-path enqueue (the seq is already committed).
+        """
+        try:
+            self._write_conn.execute(
+                "INSERT INTO outbox_hwm (namespace, hwm) VALUES (?, ?) "
+                "ON CONFLICT(namespace) DO UPDATE SET hwm = MAX(hwm, excluded.hwm)",
+                [self.namespace, seq],
+            )
+            self._write_conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "sqloutbox[%s]: record_hwm(%d) failed (non-fatal): %s",
+                self.namespace, seq, exc,
+            )
+
+    def _persisted_hwm(self) -> int:
+        """Return the persisted high-water mark for this namespace, or 0.
+
+        Tolerates a DB created before the outbox_hwm table existed (returns 0).
+        """
+        try:
+            row = self._write_conn.execute(
+                "SELECT hwm FROM outbox_hwm WHERE namespace = ?",
+                [self.namespace],
+            ).fetchone()
+        except Exception:
+            return 0  # table absent (pre-WS-5 DB) — no floor recorded
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def _seed_from_hwm(self) -> None:
+        """Lazily advance the local AUTOINCREMENT above the persisted hwm.
+
+        Runs once in __init__ (producer-side, mechanism (a)). If the persisted
+        high-water mark exceeds the current sqlite_sequence counter, seed the
+        counter up to it so the first enqueue lands above any remote value.
+        No-op when there is no recorded floor (fresh DB with empty remote).
+        """
+        hwm = self._persisted_hwm()
+        if hwm > 0:
+            self.seed_sequence(hwm)
 
     # ── Verification ───────────────────────────────────────────────────────
 

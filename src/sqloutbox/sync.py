@@ -801,13 +801,19 @@ class OutboxSyncService:
                             if target.should_inject_seq(table):
                                 sql, args = inject_outbox_seq(sql, args, row.seq)
                         except Exception as exc:
-                            # L1: a single undecodable / untransformable row must
-                            # not escape the cycle and zombify the daemon. Log once
-                            # and skip it THIS cycle (it stays pending; permanent
-                            # dead-letter routing arrives in the WS-2 plan).
+                            # L1 (WS-2 upgrade): an undecodable / untransformable
+                            # payload can never succeed — dead-letter it now
+                            # (reason='undecodable') instead of retrying forever.
+                            # The move is atomic (Outbox.dead_letter); the row is
+                            # quarantined + replayable, never lost. The namespace
+                            # then advances cleanly on the next fetch.
                             logger.error(
-                                "[outbox_sync] skipping bad row table='%s' seq=%d: %s",
+                                "[outbox_sync] dead-lettering undecodable row "
+                                "table='%s' seq=%d: %s",
                                 table, row.seq, exc,
+                            )
+                            await asyncio.to_thread(
+                                outbox.dead_letter, row.seq, "undecodable",
                             )
                             continue
                         all_stmts.append((sql, args))

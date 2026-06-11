@@ -492,3 +492,40 @@ async def test_stuck_head_fetches_only_head(tmp_path: Path):
     # Every batch the writer saw contained exactly ONE row (head-only fetch).
     assert sent_batches, "writer should have been called at least once"
     assert all(len(b) == 1 for b in sent_batches)
+
+
+def _enqueue_then_corrupt(db_path: Path, namespace: str, tag: str, raw: bytes) -> int:
+    """Enqueue a valid row, then overwrite its payload with non-JSON bytes."""
+    ob = Outbox(db_path=db_path, namespace=namespace)
+    seq = ob.enqueue(tag, b"{}")
+    conn = ob._write_conn
+    conn.execute("UPDATE outbox_queue SET payload=? WHERE seq=?",
+                 (raw.decode("latin-1"), seq))
+    conn.commit()
+    return seq
+
+
+@pytest.mark.asyncio
+async def test_undecodable_row_is_dead_lettered(tmp_path: Path):
+    """A non-JSON payload is dead-lettered (reason='undecodable'), not retried forever."""
+    writer = _SeqWriter([{"ok": True, "rows_affected": 1}])
+    svc, cfg = _service(tmp_path, writer)
+    db_path = tmp_path / "evt.db"
+    seq = _enqueue_then_corrupt(db_path, "evt",
+                                "INSERT INTO evt (a) VALUES (?)", b"not json{{{")
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.2)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    ob = Outbox(db_path=db_path, namespace="evt")
+    assert ob.pending_count() == 0          # no longer stuck in the queue
+    dead = ob.list_dead()
+    assert len(dead) == 1
+    assert dead[0].seq == seq
+    assert dead[0].reason == "undecodable"
+    assert writer.seen == []                # the bad row was never sent

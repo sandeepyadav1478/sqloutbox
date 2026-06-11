@@ -369,6 +369,10 @@ class OutboxSyncService:
         self._flush_interval = config.flush_interval
         self._cycle_count = 0
 
+        # WS-4 §5.2: cooperative shutdown. request_stop() sets this; the worker
+        # checks it at the TOP of each cycle and returns cleanly (no new cycle).
+        self._stopping = asyncio.Event()
+
         # Verification support — request_verify() sets the event,
         # worker loop checks it between drain cycles.
         self._verify_requested = asyncio.Event()
@@ -438,6 +442,18 @@ class OutboxSyncService:
         await self._ensure_schema()
         await self._seed_from_remote()
         await self._worker_loop()
+
+    def request_stop(self) -> None:
+        """Ask the worker to stop after the current cycle finishes.
+
+        WS-4 §5.2: cooperative shutdown. The worker checks this flag at the TOP
+        of each cycle and returns cleanly — it never starts a new cycle once set.
+        An in-flight cycle's confirm step (mark_synced + delete_synced for an
+        already-delivered batch) runs under asyncio.shield so it completes even
+        if a cancel arrives. At-least-once is still the honest guarantee; this
+        only prevents ROUTINE SIGTERM from manufacturing duplicates.
+        """
+        self._stopping.set()
 
     # ── Schema setup ────────────────────────────────────────────────────────
 
@@ -686,6 +702,11 @@ class OutboxSyncService:
         max_wait = self._config.table_max_wait
 
         while True:
+            if self._stopping.is_set():
+                logger.info(
+                    "[outbox_sync] stop requested — worker loop exiting cleanly",
+                )
+                return
             await asyncio.sleep(self._flush_interval)
 
             # ── Verification hook ───────────────────────────────────
@@ -961,8 +982,15 @@ class OutboxSyncService:
                     break
 
             if confirmed:
-                await asyncio.to_thread(outbox.mark_synced, confirmed)
-                await asyncio.to_thread(outbox.delete_synced, confirmed)
+                # WS-4 §5.2: write_batch already returned ok for these seqs — the
+                # remote has the rows. Confirm locally under shield so a shutdown
+                # cancel cannot land BETWEEN delivery and local cleanup (which would
+                # redeliver on restart). Shield protects the await from cancellation.
+                async def _confirm(ob=outbox, ss=confirmed):
+                    await asyncio.to_thread(ob.mark_synced, ss)
+                    await asyncio.to_thread(ob.delete_synced, ss)
+
+                await asyncio.shield(_confirm())
                 total_confirmed += len(confirmed)
                 if logger.isEnabledFor(_VERBOSE):
                     logger.log(

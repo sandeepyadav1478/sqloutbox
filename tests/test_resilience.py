@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from sqloutbox._schema import open_write_conn, thread_conn
@@ -170,7 +171,7 @@ class _FakeConfig:
     flush_interval = 1.0
     table_flush_threshold = 15
     table_max_wait = 6.0
-    db_dir = Path("/tmp")
+    db_dir = Path(tempfile.mkdtemp(prefix="sqloutbox-faketest-"))
     targets = ()
 
 
@@ -182,9 +183,15 @@ async def test_runner_clean_stop_does_not_raise(monkeypatch, tmp_path: Path):
     started = asyncio.Event()
 
     class _LiveService:
+        def __init__(self):
+            self._stop = False
+
+        def request_stop(self):
+            self._stop = True
+
         async def run(self):
             started.set()
-            while True:
+            while not self._stop:
                 await asyncio.sleep(0.01)
 
     monkeypatch.setattr(_runner, "load_config_toml", lambda _p: (_FakeConfig(), {}))

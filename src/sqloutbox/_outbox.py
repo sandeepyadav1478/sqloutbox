@@ -13,6 +13,7 @@ from sqloutbox._schema import (
     placeholders,
     thread_conn,
 )
+from sqloutbox.exceptions import QueueFullError
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +55,16 @@ class Outbox:
         retain_log_days: int = DEFAULT_RETAIN_LOG_DAYS,
         batch_size: int = DEFAULT_BATCH_SIZE,
         cleanup_every: int = DEFAULT_CLEANUP_EVERY,
+        max_pending: int | None = None,
     ) -> None:
         self.db_path         = db_path
         self.namespace       = namespace
         self.retain_log_days = retain_log_days
         self.batch_size      = batch_size
         self.cleanup_every   = cleanup_every
+        # WS-3 D2: opt-in backpressure cap. None = unbounded (default, fast path
+        # unchanged). When set, enqueue() raises QueueFullError at the cap.
+        self.max_pending     = max_pending
         # Persistent write connection — used exclusively by enqueue() from one thread
         self._write_conn = open_write_conn(db_path)
 
@@ -85,7 +90,18 @@ class Outbox:
         source:
             Identity of the middleware that produced this row
             (e.g. "SchedulerMiddleware"). Used for debugging and analytics.
+
+        Raises
+        ------
+        QueueFullError
+            Only when ``max_pending`` is set and the namespace is already at
+            the cap. With the default (``max_pending=None``) this never raises;
+            the fast INSERT path below is unchanged.
         """
+        # WS-3 D2: opt-in hard backstop. Checked BEFORE the try/except (which
+        # swallows-and-returns-None) so QueueFullError propagates to the caller.
+        if self.max_pending is not None and self.pending_count() >= self.max_pending:
+            raise QueueFullError(self.namespace, self.max_pending)
         try:
             # BEGIN IMMEDIATE acquires the write lock before the SELECT so no
             # other writer can insert between the chain-tail read and the INSERT.

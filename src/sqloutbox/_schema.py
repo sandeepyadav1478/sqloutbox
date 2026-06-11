@@ -50,6 +50,43 @@ _MIGRATE_PREV_SEQ_UNIQUE = (
     "ON outbox_queue (prev_seq)"
 )
 
+# Idempotent migrations: retry/backoff tracking columns on outbox_queue.
+# Each is wrapped in try/except in open_write_conn() (same pattern as
+# _MIGRATE_ADD_SOURCE) — a second open is a no-op (column already exists).
+_MIGRATE_ADD_ATTEMPTS = (
+    "ALTER TABLE outbox_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+)
+_MIGRATE_ADD_LAST_ATTEMPT_AT = (
+    "ALTER TABLE outbox_queue ADD COLUMN last_attempt_at TEXT"
+)
+_MIGRATE_ADD_LAST_ERROR = (
+    "ALTER TABLE outbox_queue ADD COLUMN last_error TEXT"
+)
+_MIGRATE_ADD_LAST_ERROR_CLASS = (
+    "ALTER TABLE outbox_queue ADD COLUMN last_error_class TEXT"
+)
+
+# Audited dead-letter store. A row that cannot be delivered (max_attempts hit,
+# undecodable payload, operator skip, or an unsupported inject_outbox_seq shape)
+# is MOVED here atomically — never lost. Replayable via Outbox.replay().
+# Same idempotent CREATE-IF-NOT-EXISTS pattern as outbox_sync_log.
+_CREATE_DEAD_LOG = """
+CREATE TABLE IF NOT EXISTS outbox_dead_log (
+    seq              INTEGER NOT NULL,
+    namespace        TEXT    NOT NULL,
+    tag              TEXT    NOT NULL,
+    payload          TEXT    NOT NULL,
+    prev_seq         INTEGER,
+    source           TEXT,
+    attempts         INTEGER NOT NULL,
+    last_error       TEXT,
+    last_error_class TEXT,
+    dead_lettered_at TEXT    NOT NULL,
+    reason           TEXT    NOT NULL,
+    PRIMARY KEY (namespace, seq)
+)
+"""
+
 _CREATE_SYNC_LOG = """
 CREATE TABLE IF NOT EXISTS outbox_sync_log (
     seq        INTEGER PRIMARY KEY,
@@ -105,6 +142,20 @@ def open_write_conn(db_path: Path) -> sqlite3.Connection:
     # Idempotent migration: enforce UNIQUE on prev_seq for existing DBs.
     # CREATE UNIQUE INDEX IF NOT EXISTS is a no-op when the index already exists.
     conn.execute(_MIGRATE_PREV_SEQ_UNIQUE)
+    # Idempotent migrations: retry/backoff tracking columns (wrapped — a second
+    # open raises "duplicate column" which is safe to ignore, exactly like source).
+    for _stmt in (
+        _MIGRATE_ADD_ATTEMPTS,
+        _MIGRATE_ADD_LAST_ATTEMPT_AT,
+        _MIGRATE_ADD_LAST_ERROR,
+        _MIGRATE_ADD_LAST_ERROR_CLASS,
+    ):
+        try:
+            conn.execute(_stmt)
+        except Exception:
+            pass  # column already exists — OperationalError, safe to ignore
+    # Audited dead-letter store (idempotent create).
+    conn.execute(_CREATE_DEAD_LOG)
     conn.commit()
     return conn
 

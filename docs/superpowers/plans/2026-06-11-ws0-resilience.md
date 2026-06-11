@@ -328,6 +328,8 @@ Expected: FAIL — `_BoomOutbox.pending_count()` raises, kills the loop before `
 
 - [ ] **Step 3: Wrap the per-table unit**
 
+> **Prerequisite import:** the `except (sqlite3.DatabaseError, sqlite3.OperationalError)` clause below references the `sqlite3` module, which `sync.py` does NOT currently import (only `_schema.py` and the tests do). `py_compile` will pass without it (it only checks syntax), but the except clause raises `NameError` at runtime. Add `import sqlite3` to `src/sqloutbox/sync.py`'s import block (alphabetically, between `import logging` and `import time`) as part of this step.
+
 In `src/sqloutbox/sync.py`, the inner loop currently begins at line 565 (`for table, outbox in outboxes.items():`) and ends at line 615 (`flushed_tables.append(table)`). Wrap its entire body in a try/except. Replace:
 
 ```python

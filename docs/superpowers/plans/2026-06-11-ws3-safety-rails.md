@@ -1030,6 +1030,11 @@ Append to `tests/test_safety_rails.py`:
 ```python
 # ── SQLite variable-limit chunking (F025) ─────────────────────────────────────
 
+import sqlite3
+
+import sqloutbox._outbox as _outbox_mod
+from sqloutbox._schema import thread_conn as _real_thread_conn
+
 
 def _enqueue_n(ob: Outbox, n: int) -> list[int]:
     seqs: list[int] = []
@@ -1040,18 +1045,61 @@ def _enqueue_n(ob: Outbox, n: int) -> list[int]:
     return seqs
 
 
-def test_mark_synced_chunks_over_var_limit(tmp_path: Path):
-    """mark_synced over 1000 seqs does not raise 'too many SQL variables'."""
+def test_chunked_helper_splits_at_var_chunk():
+    """_chunked() splits a seq list into <=_VAR_CHUNK pieces, in order, losing
+    nothing. This is the PRIMARY red gate: it is host- and Python-version-
+    independent (no reliance on the host's SQLite variable limit, which on modern
+    builds is 32766+ and on this host is 500000 — far above the historical 999)."""
+    # Local import: pre-implementation _VAR_CHUNK/_chunked do not exist, so this
+    # raises ImportError → THIS test fails (red) WITHOUT breaking collection of
+    # the other tests in the file (a module-top import would fail the whole file).
+    from sqloutbox._outbox import _VAR_CHUNK, _chunked
+
+    assert _VAR_CHUNK <= 999          # stays under the historical SQLite default
+    seqs = list(range(1000))
+    chunks = _chunked(seqs)
+    assert chunks                      # non-empty
+    assert all(len(c) <= _VAR_CHUNK for c in chunks)
+    assert [x for c in chunks for x in c] == seqs   # order + completeness preserved
+
+
+@pytest.fixture
+def _cap_vars_999(monkeypatch):
+    """Pin SQLITE_LIMIT_VARIABLE_NUMBER=999 on the connections mark_synced /
+    delete_synced open, so a >999-placeholder IN(...) genuinely raises
+    'too many SQL variables' — reproducing the historical default regardless of
+    the host's SQLite build. enqueue() uses the persistent write connection
+    (self._write_conn), NOT thread_conn, so this cap does not affect row insertion."""
+    def _capped(db_path):
+        conn = _real_thread_conn(db_path)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+    # _outbox.py uses the module-global name `thread_conn`; patch it there.
+    monkeypatch.setattr(_outbox_mod, "thread_conn", _capped)
+
+
+@pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "setlimit"),
+    reason="Connection.setlimit requires Python 3.11+; cannot pin the var limit",
+)
+def test_mark_synced_chunks_over_var_limit(_cap_vars_999, tmp_path: Path):
+    """mark_synced over 1000 seqs does not raise 'too many SQL variables' even
+    when the connection's variable limit is pinned to 999 (pre-chunking the single
+    IN (?x1000) would raise sqlite3.OperationalError)."""
     ob = Outbox(db_path=tmp_path / "big.db", namespace="big")
     seqs = _enqueue_n(ob, 1000)
-    ob.mark_synced(seqs)   # would raise OperationalError pre-chunking
-    # All 1000 rows are now synced=1 (so delete_synced will accept them).
+    ob.mark_synced(seqs)
     ob.delete_synced(seqs)
     assert ob.pending_count() == 0
 
 
-def test_delete_synced_chunks_over_var_limit(tmp_path: Path):
-    """delete_synced over 1000 seqs chunks its SELECT and DELETE safely."""
+@pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "setlimit"),
+    reason="Connection.setlimit requires Python 3.11+; cannot pin the var limit",
+)
+def test_delete_synced_chunks_over_var_limit(_cap_vars_999, tmp_path: Path):
+    """delete_synced over 1000 seqs chunks its SELECT and DELETE safely under the
+    999 cap."""
     ob = Outbox(db_path=tmp_path / "big.db", namespace="big")
     seqs = _enqueue_n(ob, 1000)
     ob.mark_synced(seqs)
@@ -1062,9 +1110,10 @@ def test_delete_synced_chunks_over_var_limit(tmp_path: Path):
     assert ob.pending_count() == 0
 
 
-def test_mark_synced_chunk_boundary_exact(tmp_path: Path):
-    """Exactly 900 (chunk size) and 901 (one over) both work."""
-    for n in (900, 901):
+def test_mark_delete_synced_chunk_boundary_correct(tmp_path: Path):
+    """Sizes spanning the 900-chunk boundary sync + delete EVERY row (guards against
+    an off-by-one in the chunking). Functional correctness; runs on every host."""
+    for n in (899, 900, 901, 1801):
         ob = Outbox(db_path=tmp_path / f"b{n}.db", namespace="b")
         seqs = _enqueue_n(ob, n)
         ob.mark_synced(seqs)
@@ -1075,7 +1124,9 @@ def test_mark_synced_chunk_boundary_exact(tmp_path: Path):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/test_safety_rails.py -v -k chunk`
-Expected: FAIL — `sqlite3.OperationalError: too many SQL variables` when the single `IN (?,…)` statement binds 1000 placeholders (SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older builds; the test pins the contract regardless of the local limit).
+Expected: FAIL — at minimum `test_chunked_helper_splits_at_var_chunk` fails with `ImportError: cannot import name '_chunked'` (the helper does not exist yet), and on Python 3.11+ `test_mark_synced_chunks_over_var_limit` / `test_delete_synced_chunks_over_var_limit` fail with `sqlite3.OperationalError: too many SQL variables` (the `_cap_vars_999` fixture pins the limit to 999 so the 1000-placeholder `IN (?,…)` genuinely overflows regardless of the host's real `SQLITE_MAX_VARIABLE_NUMBER`). `test_mark_delete_synced_chunk_boundary_correct` may pass pre-implementation on hosts whose real limit exceeds 1801 — it is a correctness guard, not a red gate.
+
+> **Why this differs from a naive "bind 1000 vars and expect a raise" test:** modern SQLite (3.32+, 2020) raised `SQLITE_MAX_VARIABLE_NUMBER` from 999 to 32766, and some builds report far higher (this dev host: 500000). A test that just binds 1000 placeholders never overflows on such a host, so it cannot serve as a TDD red gate. The `conn.setlimit(...999)` fixture reproduces the historical limit deterministically; the `_chunked` helper test gives a host- and version-independent red gate so coverage holds even on Python 3.10 (no `setlimit`).
 
 - [ ] **Step 3: Add the chunk constant + helper and chunk the IN(...) statements**
 
@@ -1190,7 +1241,7 @@ with:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_safety_rails.py -v -k chunk`
-Expected: PASS (3 chunk tests).
+Expected: PASS — `test_chunked_helper_splits_at_var_chunk` and `test_mark_delete_synced_chunk_boundary_correct` pass on every host; `test_mark_synced_chunks_over_var_limit` and `test_delete_synced_chunks_over_var_limit` pass on Python 3.11+ (and are SKIPPED, not failed, on 3.10 where `Connection.setlimit` is unavailable). No test fails.
 
 - [ ] **Step 5: Run the full suite to confirm no regression**
 

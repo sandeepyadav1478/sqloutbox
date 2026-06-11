@@ -6,6 +6,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Wait up to 30s for a contended write lock before raising "database is locked".
+# Two processes (producer + drain) on one WAL file routinely contend briefly;
+# without this they raise after SQLite's 5s default and (pre-L2) crash the loop.
+_BUSY_TIMEOUT_MS = 30_000
+
 
 # ── SQL statements ────────────────────────────────────────────────────────────
 
@@ -85,6 +90,7 @@ def open_write_conn(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(_CREATE_QUEUE)
     conn.execute(_CREATE_SYNC_LOG)
@@ -108,8 +114,11 @@ def thread_conn(db_path: Path) -> sqlite3.Connection:
 
     Each thread-pool task opens and closes its own connection.
     No state is shared — sqlite3 WAL handles concurrent access safely.
+    busy_timeout makes a contended write wait rather than raise immediately.
     """
-    return sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    return conn
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────

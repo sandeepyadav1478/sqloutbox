@@ -306,3 +306,66 @@ def test_hwm_does_not_break_chain_integrity(tmp_path: Path):
     rows = ob2.fetch_unsynced()
     ok, gaps = ob2.verify_chain(rows)
     assert ok is True, f"chain must stay intact after hwm seed; gaps={gaps}"
+
+
+# ── Integration ──────────────────────────────────────────────────────────────
+
+
+def test_chain_integrity_error_importable_from_package():
+    """ChainIntegrityError (Plan 3) is importable — Task 2 depends on it."""
+    from sqloutbox.exceptions import (
+        ChainIntegrityError,
+        SqloutboxError,
+    )
+    assert issubclass(ChainIntegrityError, SqloutboxError)
+
+
+def test_seeded_producer_then_read_only_verify_clean(tmp_path: Path):
+    """A producer seeded above a remote floor verifies clean, read-only."""
+    from sqloutbox._verify import verify_db_path
+
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(500)
+    producer = Outbox(db_path=db, namespace="evt")
+    producer.enqueue_batch([("INSERT INTO evt (id) VALUES (?)", f"[{i}]".encode())
+                            for i in range(4)])
+    producer._write_conn.close()
+
+    result = verify_db_path(db, namespace="evt")
+    assert result.ok is True
+    assert result.chain_ok is True
+    assert result.total_rows == 4
+    assert result.seq_range is not None
+    assert result.seq_range[0] > 500  # all seqs above the seeded floor
+
+
+def test_db_dir_verify_skips_foreign_and_missing(tmp_path: Path, capsys):
+    """CLI --db-dir scan: a foreign file is reported FAIL, a healthy outbox OK, neither mutated."""
+    from sqloutbox.cli import cmd_verify
+
+    # One healthy outbox file + one foreign sqlite file in the same dir.
+    Outbox(db_path=tmp_path / "good.db", namespace="good").enqueue(
+        "INSERT INTO good (id) VALUES (?)", b"[1]"
+    )
+    foreign = tmp_path / "foreign.db"
+    c = sqlite3.connect(str(foreign))
+    c.execute("CREATE TABLE x (a)")
+    c.commit()
+    c.close()
+    foreign_mtime = os.path.getmtime(foreign)
+
+    with pytest.raises(SystemExit) as ei:
+        cmd_verify(config_path=None, db_dir_path=tmp_path)
+    # Exit 1 because the foreign file fails ("not an outbox DB").
+    assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "good" in out
+    assert "FAIL" in out  # foreign.db reported, not migrated
+    # Foreign file untouched.
+    assert os.path.getmtime(foreign) == foreign_mtime
+    c2 = sqlite3.connect(f"file:{foreign}?mode=ro", uri=True)
+    tables = {r[0] for r in c2.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    c2.close()
+    assert "outbox_queue" not in tables

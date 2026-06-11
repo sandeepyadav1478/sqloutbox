@@ -143,6 +143,31 @@ def test_record_attempt_increments_and_persists(tmp_path: Path):
     assert ob.peek_head().attempts == 2
 
 
+def test_record_attempt_returns_new_count_for_that_seq(tmp_path: Path):
+    """record_attempt returns the new attempts count for the EXACT seq it bumped.
+
+    Regression guard (WS-1/2 Task 6 follow-up): the drain must read the failing
+    row's own count, not peek_head() — which in a mixed batch (an earlier row in
+    the same namespace already confirmed-ok but not yet mark_synced) points at a
+    DIFFERENT, still-unsynced row and reports the wrong attempt number.
+    """
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    s1 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    s2 = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+    assert s1 is not None and s2 is not None
+
+    # s1 is the head and is still unsynced. Record a failure on the SUCCESSOR s2.
+    # peek_head() would return s1 (attempts=0); record_attempt must report s2's count.
+    assert ob.record_attempt(s2, error="boom", error_class="TRANSIENT") == 1
+    assert ob.record_attempt(s2, error="boom again", error_class="TRANSIENT") == 2
+    # peek_head() still sees s1 with attempts=0 — proving the return value is the
+    # only correct source for the failing row's count.
+    head = ob.peek_head()
+    assert head is not None and head.seq == s1 and head.attempts == 0
+    # A record_attempt on an absent seq returns 0 (no row updated).
+    assert ob.record_attempt(99999, error="x", error_class="UNKNOWN") == 0
+
+
 def test_seq_accounted_consults_dead_log(tmp_path: Path):
     import sqlite3
     ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")

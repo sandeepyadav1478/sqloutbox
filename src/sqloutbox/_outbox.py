@@ -420,13 +420,18 @@ class Outbox:
             last_error=r[7], last_error_class=r[8],
         )
 
-    def record_attempt(self, seq: int, error: str, error_class: str) -> None:
-        """Record a failed delivery attempt on one row.
+    def record_attempt(self, seq: int, error: str, error_class: str) -> int:
+        """Record a failed delivery attempt on one row; return its new count.
 
         Increments ``attempts`` and stores the destination error + its class
         and the attempt timestamp (ISO-8601 UTC). Persisted so the §3.2 backoff
         gate and the §3.4 health signal can read it back, possibly cross-process.
-        Opens its own connection — safe to call from any thread.
+
+        Returns the new ``attempts`` value for THIS ``seq`` (read back in the same
+        transaction), or 0 if ``seq`` was absent (no row updated). The drain must
+        use this return value — not ``peek_head()`` — for the failing row's count,
+        because in a mixed batch ``peek_head()`` may point at a different,
+        still-unsynced earlier row. Opens its own connection — safe from any thread.
         """
         with thread_conn(self.db_path) as conn:
             conn.execute(
@@ -436,7 +441,13 @@ class Outbox:
                 "WHERE namespace = ? AND seq = ?",
                 [now_iso(), error, error_class, self.namespace, seq],
             )
+            row = conn.execute(
+                "SELECT attempts FROM outbox_queue "
+                "WHERE namespace = ? AND seq = ?",
+                [self.namespace, seq],
+            ).fetchone()
             conn.commit()
+        return row[0] if row else 0
 
     def dead_letter(self, seq: int, reason: str) -> bool:
         """Atomically MOVE one queue row to outbox_dead_log (never lose it).

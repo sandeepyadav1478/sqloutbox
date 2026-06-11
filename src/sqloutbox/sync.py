@@ -928,12 +928,12 @@ class OutboxSyncService:
 
                 # A genuine failure: HOLD. Record the attempt, then either
                 # dead-letter (cap hit) or stop confirming this namespace.
-                await asyncio.to_thread(
+                # record_attempt returns the new count for THIS seq. We must use
+                # it (not peek_head()) — in a mixed batch an earlier confirmed-ok
+                # row in this namespace is not yet mark_synced, so peek_head()
+                # would point at it (attempts=0), mis-reporting the failing row.
+                attempts_now = await asyncio.to_thread(
                     outbox.record_attempt, seq, err, err_class,
-                )
-                attempts_now = (
-                    outbox.peek_head().attempts
-                    if outbox.peek_head() is not None else 0
                 )
                 if max_attempts is not None and attempts_now >= max_attempts:
                     moved = await asyncio.to_thread(

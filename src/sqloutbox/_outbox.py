@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from sqloutbox._models import DeadRow, QueueRow
+from sqloutbox._models import DeadRow, NamespaceHealth, QueueRow
 from sqloutbox._schema import (
     now_iso,
     open_write_conn,
@@ -407,6 +407,76 @@ class Outbox:
             ).fetchone()
         return row[0] if row else 0
 
+    def health(self, max_pending: int | None = None) -> NamespaceHealth:
+        """Return a read-only health snapshot for this namespace.
+
+        PURE READ — a single SELECT against the WAL SQLite file. Never mutates
+        a row, never calls back into the consuming app, never imports an app
+        module. Safe to call from a different process than the drain (WAL: a
+        read never blocks the writer). This is the consumer's *eyes*; the
+        consumer pulls it on its own schedule and owns every threshold
+        (control-direction invariant — durable-retry spec §3.4 / §4).
+
+        Parameters
+        ----------
+        max_pending:
+            Optional cap used only to derive ``capacity_pct = depth /
+            max_pending``. None (default) → ``capacity_pct`` is None. The
+            library does NOT own a default; callers that configured
+            ``OutboxConfig.max_pending`` pass it in. The 80% stop watermark is
+            a PRODUCING-APP threshold, not library config (hardening §4.2).
+
+        Returns
+        -------
+        NamespaceHealth
+        """
+        with thread_conn(self.db_path) as conn:
+            depth_row = conn.execute(
+                "SELECT COUNT(*) FROM outbox_queue "
+                "WHERE namespace = ? AND synced = 0",
+                [self.namespace],
+            ).fetchone()
+            depth = depth_row[0] if depth_row else 0
+
+            # The retry columns (attempts/last_attempt_at/last_error/
+            # last_error_class) are added by Plan 2 (WS-2). If they are not yet
+            # present (e.g. running on a pre-WS-2 file), degrade gracefully to a
+            # not-stuck reading instead of raising — health() must never crash.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(outbox_queue)")}
+            head_attempts = 0
+            last_error: str | None = None
+            last_error_class: str | None = None
+            last_attempt_at: str | None = None
+            if {"attempts", "last_attempt_at", "last_error",
+                "last_error_class"} <= cols:
+                head = conn.execute(
+                    "SELECT attempts, last_attempt_at, last_error, "
+                    "last_error_class FROM outbox_queue "
+                    "WHERE namespace = ? AND synced = 0 "
+                    "ORDER BY seq LIMIT 1",
+                    [self.namespace],
+                ).fetchone()
+                if head is not None:
+                    head_attempts    = head[0] or 0
+                    last_attempt_at  = head[1]
+                    last_error       = head[2]
+                    last_error_class = head[3]
+
+        capacity_pct: float | None = None
+        if max_pending is not None and max_pending > 0:
+            capacity_pct = depth / max_pending
+
+        return NamespaceHealth(
+            namespace=self.namespace,
+            depth=depth,
+            head_attempts=head_attempts,
+            is_stuck=head_attempts > 0,
+            last_error=last_error,
+            last_error_class=last_error_class,
+            last_attempt_at=last_attempt_at,
+            capacity_pct=capacity_pct,
+        )
+
     def peek_head(self) -> QueueRow | None:
         """Return the lowest-seq undelivered row in this namespace, or None.
 
@@ -693,3 +763,52 @@ class Outbox:
             "LIMIT 1",
             [seq, seq, seq],
         ).fetchone())
+
+
+def health_all(
+    db_dir: Path, max_pending: int | None = None
+) -> list[NamespaceHealth]:
+    """Enumerate health for every namespace under ``db_dir`` (free function).
+
+    NOT a method — it takes a directory, not ``self``. Globs ``{db_dir}/*.db``
+    and, for each file, emits one :class:`NamespaceHealth` per distinct
+    namespace it contains (``SELECT DISTINCT namespace``). The common layout is
+    one file per table (namespace == table), giving one snapshot per file; the
+    multiple-namespaces-per-file case (allowed by ``shared_outbox``) is handled.
+
+    PURE READ — same control-direction invariant as :meth:`Outbox.health`.
+    Results are sorted by namespace for stable output.
+
+    Parameters
+    ----------
+    db_dir:
+        Directory containing the per-table ``*.db`` outbox files.
+    max_pending:
+        Forwarded to each ``health()`` for ``capacity_pct`` (None → None).
+
+    Returns
+    -------
+    list[NamespaceHealth]
+        Empty list if ``db_dir`` does not exist or contains no ``*.db`` files.
+    """
+    if not db_dir.is_dir():
+        return []
+    out: list[NamespaceHealth] = []
+    for db_file in sorted(db_dir.glob("*.db")):
+        # Read-only enumerate of namespaces in this file.
+        with thread_conn(db_file) as conn:
+            names = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT namespace FROM outbox_queue "
+                    "ORDER BY namespace"
+                ).fetchall()
+            ]
+        if not names:
+            # File exists but has no rows yet — report the file's stem as an
+            # empty namespace so depth=0 is still observable.
+            names = [db_file.stem]
+        for namespace in names:
+            ob = Outbox(db_path=db_file, namespace=namespace)
+            out.append(ob.health(max_pending=max_pending))
+    out.sort(key=lambda h: h.namespace)
+    return out

@@ -125,3 +125,83 @@ async def test_confirm_completes_then_no_redelivery_after_restart(tmp_path: Path
     svc2.request_stop()
     await asyncio.wait_for(task2, timeout=2.0)
     assert writer2.delivered == []
+
+
+import sqlite3
+
+
+def test_writerless_target_fails_fast_at_init(tmp_path: Path):
+    """A target with no matching writer raises ValueError at construction —
+    it never silently black-holes rows."""
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(
+            TargetConfig(name="primary", tables=("evt",), inject_outbox_seq=False),
+            TargetConfig(name="missing", tables=("other",), inject_outbox_seq=False),
+        ),
+        auto_schema=False,
+    )
+    with pytest.raises(ValueError) as ei:
+        OutboxSyncService(config=cfg, writers={"primary": _SlowConfirmWriter()})
+    # The error names the offending target so the misconfiguration is obvious.
+    assert "missing" in str(ei.value)
+
+
+def test_all_targets_have_writers_constructs_ok(tmp_path: Path):
+    """When every target has a writer, construction succeeds (no false positive)."""
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(TargetConfig(name="primary", tables=("evt",),
+                              inject_outbox_seq=False),),
+        auto_schema=False,
+    )
+    svc = OutboxSyncService(
+        config=cfg, writers={"primary": _SlowConfirmWriter()},
+    )
+    assert svc is not None
+
+
+class _ExplodingWriter:
+    """Writer whose write_batch always raises — simulates a broken target."""
+    async def write_batch(self, stmts):
+        raise RuntimeError("writer exploded")
+
+
+@pytest.mark.asyncio
+async def test_broken_writer_isolated_siblings_drain(tmp_path: Path):
+    """One target whose writer always raises must not halt a sibling target.
+
+    (Proves the WS-0 Layer-2 isolation property holds through the per-target
+    flush boundary — the broken target's write failure is caught and the
+    healthy sibling still delivers.)"""
+    good = _SlowConfirmWriter()
+    bad = _ExplodingWriter()
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(
+            TargetConfig(name="broken", tables=("bad",), inject_outbox_seq=False),
+            TargetConfig(name="healthy", tables=("good",), inject_outbox_seq=False),
+        ),
+        flush_interval=0.01,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        auto_schema=False,
+    )
+    svc = OutboxSyncService(
+        config=cfg, writers={"broken": bad, "healthy": good},
+    )
+
+    Outbox(db_path=tmp_path / "bad.db", namespace="bad").enqueue(
+        "INSERT INTO bad (a) VALUES (?)", json.dumps([1]).encode()
+    )
+    Outbox(db_path=tmp_path / "good.db", namespace="good").enqueue(
+        "INSERT INTO good (a) VALUES (?)", json.dumps([2]).encode()
+    )
+
+    task = asyncio.create_task(svc.run())
+    await asyncio.sleep(0.2)
+    svc.request_stop()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    # Healthy sibling delivered despite the broken target raising every cycle.
+    assert any("good" in s for s, _ in good.delivered)

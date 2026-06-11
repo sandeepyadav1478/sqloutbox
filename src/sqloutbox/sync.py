@@ -373,6 +373,18 @@ class OutboxSyncService:
         # checks it at the TOP of each cycle and returns cleanly (no new cycle).
         self._stopping = asyncio.Event()
 
+        # WS-4 §5.3: fail fast on a writerless target. Without a writer the
+        # worker would silently `continue` past it forever — every row to that
+        # target black-holed with no signal. Surface the misconfiguration at
+        # construction instead. (Empty targets is fine — middleware-only use.)
+        missing = [t.name for t in config.targets if t.name not in writers]
+        if missing:
+            raise ValueError(
+                "OutboxSyncService: no writer provided for target(s) "
+                f"{missing}. Every config.targets entry must have a matching "
+                f"key in `writers`. Provided writers: {sorted(writers)}."
+            )
+
         # Verification support — request_verify() sets the event,
         # worker loop checks it between drain cycles.
         self._verify_requested = asyncio.Event()

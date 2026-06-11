@@ -21,6 +21,15 @@ DEFAULT_RETAIN_LOG_DAYS = 30
 DEFAULT_BATCH_SIZE      = 50
 DEFAULT_CLEANUP_EVERY   = 500
 
+# SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 on many builds. Chunk seq lists
+# bound into IN (?,?,…) statements to stay safely below it. (WS-3, F025.)
+_VAR_CHUNK = 900
+
+
+def _chunked(seqs: list[int], size: int = _VAR_CHUNK) -> list[list[int]]:
+    """Split a seq list into consecutive chunks of at most ``size`` items."""
+    return [seqs[i:i + size] for i in range(0, len(seqs), size)]
+
 
 class Outbox:
     """Durable, singly-linked SQLite event outbox.
@@ -276,16 +285,20 @@ class Outbox:
     def mark_synced(self, seqs: list[int]) -> None:
         """Mark rows as confirmed delivered. Does NOT delete them yet.
 
+        Chunks the seq list to <= _VAR_CHUNK per statement so a large
+        batch_size cannot trip SQLITE_MAX_VARIABLE_NUMBER.
+
         Opens its own connection — safe to call from any thread.
         """
         if not seqs:
             return
         with thread_conn(self.db_path) as conn:
-            conn.execute(
-                f"UPDATE outbox_queue SET synced = 1 "
-                f"WHERE seq IN ({placeholders(len(seqs))})",
-                seqs,
-            )
+            for chunk in _chunked(seqs):
+                conn.execute(
+                    f"UPDATE outbox_queue SET synced = 1 "
+                    f"WHERE seq IN ({placeholders(len(chunk))})",
+                    chunk,
+                )
 
     def delete_synced(self, seqs: list[int]) -> None:
         """Delete delivered rows and record them in outbox_sync_log.
@@ -304,13 +317,17 @@ class Outbox:
         if not seqs:
             return
         with thread_conn(self.db_path) as conn:
-            # Step 1: Batch-fetch all candidate rows — verify each is synced
-            rows_data = conn.execute(
-                f"SELECT seq, synced FROM outbox_queue "
-                f"WHERE seq IN ({placeholders(len(seqs))})",
-                seqs,
-            ).fetchall()
-            by_seq = {r[0]: bool(r[1]) for r in rows_data}
+            # Step 1: Batch-fetch all candidate rows — verify each is synced.
+            # Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER.
+            by_seq: dict[int, bool] = {}
+            for chunk in _chunked(seqs):
+                rows_data = conn.execute(
+                    f"SELECT seq, synced FROM outbox_queue "
+                    f"WHERE seq IN ({placeholders(len(chunk))})",
+                    chunk,
+                ).fetchall()
+                for r in rows_data:
+                    by_seq[r[0]] = bool(r[1])
 
             safe: list[int] = []
             for seq in seqs:
@@ -334,11 +351,12 @@ class Outbox:
                 "VALUES (?, ?, ?)",
                 [(s, self.namespace, now) for s in safe],
             )
-            conn.execute(
-                f"DELETE FROM outbox_queue "
-                f"WHERE seq IN ({placeholders(len(safe))})",
-                safe,
-            )
+            for chunk in _chunked(safe):
+                conn.execute(
+                    f"DELETE FROM outbox_queue "
+                    f"WHERE seq IN ({placeholders(len(chunk))})",
+                    chunk,
+                )
             logger.debug(
                 "sqloutbox[%s]: deleted %d delivered rows", self.namespace, len(safe)
             )

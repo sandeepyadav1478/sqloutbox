@@ -127,3 +127,96 @@ def test_guard_rejects_insert_without_values():
     """INSERT with no VALUES keyword at all → rejected."""
     with pytest.raises(UnsupportedStatementError):
         inject_outbox_seq("INSERT INTO t DEFAULT VALUES", [], outbox_seq=1)
+
+
+# ── SQLite variable-limit chunking (F025) ─────────────────────────────────────
+
+import sqlite3
+
+import sqloutbox._outbox as _outbox_mod
+from sqloutbox._schema import thread_conn as _real_thread_conn
+
+
+def _enqueue_n(ob: Outbox, n: int) -> list[int]:
+    seqs: list[int] = []
+    for i in range(n):
+        s = ob.enqueue("INSERT INTO big (a) VALUES (?)", json.dumps([i]).encode())
+        assert s is not None
+        seqs.append(s)
+    return seqs
+
+
+def test_chunked_helper_splits_at_var_chunk():
+    """_chunked() splits a seq list into <=_VAR_CHUNK pieces, in order, losing
+    nothing. This is the PRIMARY red gate: it is host- and Python-version-
+    independent (no reliance on the host's SQLite variable limit, which on modern
+    builds is 32766+ and on this host is 500000 — far above the historical 999)."""
+    # Local import: pre-implementation _VAR_CHUNK/_chunked do not exist, so this
+    # raises ImportError → THIS test fails (red) WITHOUT breaking collection of
+    # the other tests in the file (a module-top import would fail the whole file).
+    from sqloutbox._outbox import _VAR_CHUNK, _chunked
+
+    assert _VAR_CHUNK <= 999          # stays under the historical SQLite default
+    seqs = list(range(1000))
+    chunks = _chunked(seqs)
+    assert chunks                      # non-empty
+    assert all(len(c) <= _VAR_CHUNK for c in chunks)
+    assert [x for c in chunks for x in c] == seqs   # order + completeness preserved
+
+
+@pytest.fixture
+def _cap_vars_999(monkeypatch):
+    """Pin SQLITE_LIMIT_VARIABLE_NUMBER=999 on the connections mark_synced /
+    delete_synced open, so a >999-placeholder IN(...) genuinely raises
+    'too many SQL variables' — reproducing the historical default regardless of
+    the host's SQLite build. enqueue() uses the persistent write connection
+    (self._write_conn), NOT thread_conn, so this cap does not affect row insertion."""
+    def _capped(db_path):
+        conn = _real_thread_conn(db_path)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+    # _outbox.py uses the module-global name `thread_conn`; patch it there.
+    monkeypatch.setattr(_outbox_mod, "thread_conn", _capped)
+
+
+@pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "setlimit"),
+    reason="Connection.setlimit requires Python 3.11+; cannot pin the var limit",
+)
+def test_mark_synced_chunks_over_var_limit(_cap_vars_999, tmp_path: Path):
+    """mark_synced over 1000 seqs does not raise 'too many SQL variables' even
+    when the connection's variable limit is pinned to 999 (pre-chunking the single
+    IN (?x1000) would raise sqlite3.OperationalError)."""
+    ob = Outbox(db_path=tmp_path / "big.db", namespace="big")
+    seqs = _enqueue_n(ob, 1000)
+    ob.mark_synced(seqs)
+    ob.delete_synced(seqs)
+    assert ob.pending_count() == 0
+
+
+@pytest.mark.skipif(
+    not hasattr(sqlite3.Connection, "setlimit"),
+    reason="Connection.setlimit requires Python 3.11+; cannot pin the var limit",
+)
+def test_delete_synced_chunks_over_var_limit(_cap_vars_999, tmp_path: Path):
+    """delete_synced over 1000 seqs chunks its SELECT and DELETE safely under the
+    999 cap."""
+    ob = Outbox(db_path=tmp_path / "big.db", namespace="big")
+    seqs = _enqueue_n(ob, 1000)
+    ob.mark_synced(seqs)
+    ob.delete_synced(seqs)
+    assert ob.pending_count() == 0
+    # Re-deleting the same (now absent) seqs is a no-op, not an error.
+    ob.delete_synced(seqs)
+    assert ob.pending_count() == 0
+
+
+def test_mark_delete_synced_chunk_boundary_correct(tmp_path: Path):
+    """Sizes spanning the 900-chunk boundary sync + delete EVERY row (guards against
+    an off-by-one in the chunking). Functional correctness; runs on every host."""
+    for n in (899, 900, 901, 1801):
+        ob = Outbox(db_path=tmp_path / f"b{n}.db", namespace="b")
+        seqs = _enqueue_n(ob, n)
+        ob.mark_synced(seqs)
+        ob.delete_synced(seqs)
+        assert ob.pending_count() == 0

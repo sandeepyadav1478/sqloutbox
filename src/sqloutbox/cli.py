@@ -521,10 +521,14 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
 
     Prints a structured report and exits with code 0 (all OK) or 1 (failures).
     """
-    from sqloutbox._outbox import Outbox
-    from sqloutbox._verify import verify_all
+    from sqloutbox._verify import VerifyResult, verify_db_path
 
-    outboxes: dict[str, Outbox] = {}
+    from sqloutbox._schema import now_iso
+    import time
+
+    # Each entry: (display_label, db_path, namespace).
+    config_paths_seen: list[tuple[str, Path, str]] = []
+    db_paths: list[Path] = []
 
     if config_path is not None:
         from sqloutbox._runner import load_config_toml
@@ -534,8 +538,10 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
             for table in target.tables:
                 db_path = db_dir / f"{table}.db"
                 if db_path.exists():
-                    outboxes[f"{target.name}.{table}"] = Outbox(
-                        db_path=db_path, namespace=table,
+                    # Read-only inspect by path + explicit namespace — no Outbox
+                    # construction, so the file is never created/migrated.
+                    config_paths_seen.append(
+                        (f"{target.name}.{table}", db_path, table)
                     )
                 else:
                     print(f"  skip {table}.db — file not found at {db_path}")
@@ -544,9 +550,10 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
         if not db_dir_path.is_dir():
             print(f"error: not a directory: {db_dir_path}", file=sys.stderr)
             sys.exit(1)
-        for db_file in sorted(db_dir_path.glob("*.db")):
-            name = db_file.stem
-            outboxes[name] = Outbox(db_path=db_file, namespace=name)
+        # Read-only scan: inspect each *.db by path. Never construct an Outbox
+        # here — that calls open_write_conn() and would CREATE/MIGRATE the file
+        # (spec §6.1). Files that are missing/foreign are reported, not created.
+        db_paths = sorted(db_dir_path.glob("*.db"))
 
     else:
         print(
@@ -558,12 +565,29 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
         )
         sys.exit(1)
 
-    if not outboxes:
+    # Build the work list. --config gives explicit (label, path, ns); --db-dir
+    # gives a list of paths whose namespace is auto-detected by verify_db_path.
+    work: list[tuple[str, Path, str | None]] = []
+    if config_path is not None:
+        for label, path, ns in config_paths_seen:
+            work.append((label, path, ns))
+    else:
+        for path in db_paths:
+            work.append((path.stem, path, None))
+
+    if not work:
         print("no .db files found — nothing to verify")
         sys.exit(0)
 
-    # Run verification
-    result = verify_all(outboxes)
+    # Run verification — every open is read-only (verify_db_path).
+    t0 = time.monotonic()
+    tables = tuple(verify_db_path(path, namespace=ns) for _label, path, ns in work)
+    result = VerifyResult(
+        ok=all(t.ok for t in tables),
+        tables=tables,
+        checked_at=now_iso(),
+        duration_ms=round((time.monotonic() - t0) * 1000, 1),
+    )
 
     # Print report
     print()

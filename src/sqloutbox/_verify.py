@@ -23,9 +23,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqloutbox._schema import now_iso, thread_conn
+from sqloutbox._schema import now_iso, open_read_conn, thread_conn
 
 if TYPE_CHECKING:
     from sqloutbox._outbox import Outbox
@@ -65,53 +66,111 @@ class VerifyResult:
 def verify_outbox(outbox: Outbox) -> TableVerifyResult:
     """Run a comprehensive integrity check on a single outbox.
 
-    All checks are read-only — no writes to the database.
-
-    Checks performed:
-
-    1. **Chain integrity** — fetch all unsynced rows and verify the
-       ``prev_seq`` singly-linked chain using ``Outbox.verify_chain()``.
-    2. **Sequence continuity** — walk all ``seq`` values in
-       ``outbox_queue`` and check that every gap is accounted for by
-       a corresponding entry in ``outbox_sync_log``.
-    3. **Timestamp monotonicity** — ``created_at`` must be
-       non-decreasing when ordered by ``seq``.
-    4. **Orphan sync_log** — count ``outbox_sync_log`` entries whose
-       ``seq`` exceeds the current ``MAX(seq)`` in ``outbox_queue``
-       (normal after full delivery, but flags truncation).
-    5. **Row counts** — pending, total queue rows, total sync_log rows.
+    All checks are READ-ONLY — opened via ``open_read_conn`` so inspecting a
+    file can never create, migrate, or WAL-switch it (spec §6.1). Delegates
+    the actual checks to ``verify_db_path`` against the outbox's file/namespace.
     """
-    errors: list[str] = []
-    ns = outbox.namespace
-    db_path = str(outbox.db_path)
+    return verify_db_path(outbox.db_path, namespace=outbox.namespace)
 
-    with thread_conn(outbox.db_path) as conn:
+
+def verify_db_path(db_path: Path, namespace: str | None = None) -> TableVerifyResult:
+    """Inspect a ``.db`` file READ-ONLY and report its integrity.
+
+    Opens with ``open_read_conn`` (``mode=ro``): never creates the file, never
+    migrates it, never switches journal mode. A missing file or a file without
+    an ``outbox_queue`` table is REPORTED as "not an outbox DB" (``ok=False``)
+    rather than crashing or being created (spec §6.1, F005/F050).
+
+    A forked-chain DB (two rows sharing a ``prev_seq``) is OPENED and the fork
+    is reported — read-only verify must remain usable as a diagnostic even on a
+    DB that would crash the writable migration path (spec §6.2).
+
+    Parameters
+    ----------
+    db_path:
+        Path to the SQLite file to inspect.
+    namespace:
+        Namespace to scope the checks to. When ``None`` (e.g. CLI scanning a
+        stray file), the file's single namespace is auto-detected; if the file
+        holds multiple namespaces the first (by name) is used and the rest are
+        ignored — the CLI constructs one Outbox per file/namespace anyway.
+    """
+    import sqlite3
+
+    db_path = Path(db_path)
+    errors: list[str] = []
+    label = namespace if namespace is not None else db_path.stem
+
+    # ── Open read-only; a missing file or a foreign file is reported, never
+    #    created/migrated. ────────────────────────────────────────────────
+    try:
+        probe = open_read_conn(db_path)
+    except sqlite3.OperationalError as exc:
+        return TableVerifyResult(
+            table=label, db_path=str(db_path), ok=False,
+            pending_count=0, total_rows=0, sync_log_rows=0, chain_ok=False,
+            errors=(f"not an outbox DB: cannot open {db_path} read-only ({exc})",),
+        )
+
+    try:
+        # Is this actually an outbox DB? (foreign/empty file → report, skip.)
+        has_queue = probe.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox_queue'"
+        ).fetchone()
+        if not has_queue:
+            return TableVerifyResult(
+                table=label, db_path=str(db_path), ok=False,
+                pending_count=0, total_rows=0, sync_log_rows=0, chain_ok=False,
+                errors=(f"not an outbox DB: no outbox_queue table in {db_path}",),
+            )
+
+        # Auto-detect namespace when not supplied (CLI stray-file scan).
+        ns = namespace
+        if ns is None:
+            ns_row = probe.execute(
+                "SELECT namespace FROM outbox_queue ORDER BY namespace LIMIT 1"
+            ).fetchone()
+            ns = ns_row[0] if ns_row else label
+        label = ns
+
         # ── Row counts ──────────────────────────────────────────────
-        total_rows = conn.execute(
+        total_rows = probe.execute(
             "SELECT COUNT(*) FROM outbox_queue WHERE namespace = ?", [ns],
         ).fetchone()[0]
-
-        pending_count = conn.execute(
+        pending_count = probe.execute(
             "SELECT COUNT(*) FROM outbox_queue WHERE namespace = ? AND synced = 0",
             [ns],
         ).fetchone()[0]
-
-        sync_log_rows = conn.execute(
+        sync_log_rows = probe.execute(
             "SELECT COUNT(*) FROM outbox_sync_log WHERE namespace = ?", [ns],
         ).fetchone()[0]
 
         # ── Seq range ───────────────────────────────────────────────
-        range_row = conn.execute(
+        range_row = probe.execute(
             "SELECT MIN(seq), MAX(seq) FROM outbox_queue WHERE namespace = ?",
             [ns],
         ).fetchone()
-        if range_row[0] is not None:
-            seq_range: tuple[int, int] | None = (range_row[0], range_row[1])
-        else:
-            seq_range = None
+        seq_range: tuple[int, int] | None = (
+            (range_row[0], range_row[1]) if range_row[0] is not None else None
+        )
+
+        # ── Forked-chain detection (read-only; never crashes) ───────
+        # Two rows sharing a non-NULL prev_seq = a fork. The writable
+        # migration would raise IntegrityError here (Task 2 turns that into
+        # ChainIntegrityError) — but the diagnostic must still REPORT it.
+        forked = probe.execute(
+            "SELECT prev_seq, COUNT(*) c FROM outbox_queue "
+            "WHERE namespace = ? AND prev_seq IS NOT NULL "
+            "GROUP BY prev_seq HAVING c > 1",
+            [ns],
+        ).fetchall()
+        chain_forked = bool(forked)
+        if chain_forked:
+            for prev_seq, c in forked:
+                errors.append(f"forked chain: {c} rows share prev_seq={prev_seq}")
 
         # ── 1. Chain integrity (unsynced rows) ──────────────────────
-        unsynced = conn.execute(
+        unsynced = probe.execute(
             "SELECT seq, tag, payload, prev_seq, source "
             "FROM outbox_queue "
             "WHERE namespace = ? AND synced = 0 "
@@ -119,93 +178,85 @@ def verify_outbox(outbox: Outbox) -> TableVerifyResult:
             [ns],
         ).fetchall()
 
-    # Use Outbox.verify_chain() for the chain check
-    from sqloutbox._models import QueueRow
+        from sqloutbox._models import QueueRow
 
-    rows = [
-        QueueRow(seq=r[0], tag=r[1], payload=r[2].encode(), prev_seq=r[3], source=r[4] or "")
-        for r in unsynced
-    ]
-    chain_ok, chain_gaps_list = outbox.verify_chain(rows)
-    if not chain_ok:
-        errors.append(f"chain gap: missing seq(s) {chain_gaps_list}")
+        rows = [
+            QueueRow(seq=r[0], tag=r[1], payload=r[2].encode(),
+                     prev_seq=r[3], source=r[4] or "")
+            for r in unsynced
+        ]
+        chain_ok, chain_gaps_list = _verify_chain_rows(probe, ns, rows)
+        if not chain_ok:
+            errors.append(f"chain gap: missing seq(s) {chain_gaps_list}")
 
-    # ── 2. Sequence continuity ──────────────────────────────────
-    seq_continuous = True
-    with thread_conn(outbox.db_path) as conn:
+        # ── 2. Sequence continuity ──────────────────────────────────
         all_seqs = [
-            r[0] for r in conn.execute(
+            r[0] for r in probe.execute(
                 "SELECT seq FROM outbox_queue WHERE namespace = ? ORDER BY seq",
                 [ns],
             ).fetchall()
         ]
         sync_log_seqs = {
-            r[0] for r in conn.execute(
+            r[0] for r in probe.execute(
                 "SELECT seq FROM outbox_sync_log WHERE namespace = ?", [ns],
             ).fetchall()
         }
-
-    if len(all_seqs) >= 2:
-        for i in range(1, len(all_seqs)):
-            prev_s = all_seqs[i - 1]
-            curr_s = all_seqs[i]
-            if curr_s != prev_s + 1:
-                # Check if every missing seq is in sync_log
-                for gap_seq in range(prev_s + 1, curr_s):
-                    if gap_seq not in sync_log_seqs:
-                        seq_continuous = False
-                        errors.append(
-                            f"seq gap: {prev_s} -> {curr_s}, "
-                            f"seq {gap_seq} not in queue or sync_log"
-                        )
+        seq_continuous = True
+        if len(all_seqs) >= 2:
+            for i in range(1, len(all_seqs)):
+                prev_s, curr_s = all_seqs[i - 1], all_seqs[i]
+                if curr_s != prev_s + 1:
+                    for gap_seq in range(prev_s + 1, curr_s):
+                        if gap_seq not in sync_log_seqs:
+                            seq_continuous = False
+                            errors.append(
+                                f"seq gap: {prev_s} -> {curr_s}, "
+                                f"seq {gap_seq} not in queue or sync_log"
+                            )
+                            break
+                    if not seq_continuous:
                         break
-                if not seq_continuous:
-                    break
 
-    # ── 3. Timestamp monotonicity ───────────────────────────────
-    timestamps_monotonic = True
-    with thread_conn(outbox.db_path) as conn:
-        ts_rows = conn.execute(
+        # ── 3. Timestamp monotonicity ───────────────────────────────
+        ts_rows = probe.execute(
             "SELECT seq, created_at FROM outbox_queue "
             "WHERE namespace = ? ORDER BY seq",
             [ns],
         ).fetchall()
+        timestamps_monotonic = True
+        prev_ts = ""
+        for seq, created_at in ts_rows:
+            if created_at < prev_ts:
+                timestamps_monotonic = False
+                errors.append(
+                    f"timestamp not monotonic: seq {seq} has {created_at} "
+                    f"< previous {prev_ts}"
+                )
+                break
+            prev_ts = created_at
 
-    prev_ts = ""
-    for seq, created_at in ts_rows:
-        if created_at < prev_ts:
-            timestamps_monotonic = False
-            errors.append(
-                f"timestamp not monotonic: seq {seq} has {created_at} "
-                f"< previous {prev_ts}"
-            )
-            break
-        prev_ts = created_at
-
-    # ── 4. Orphan sync_log detection ────────────────────────────
-    with thread_conn(outbox.db_path) as conn:
-        max_queue_seq = conn.execute(
+        # ── 4. Orphan sync_log detection ────────────────────────────
+        max_queue_seq = probe.execute(
             "SELECT COALESCE(MAX(seq), 0) FROM outbox_queue WHERE namespace = ?",
             [ns],
         ).fetchone()[0]
-
-        # sync_log entries beyond current queue max — normal after delivery,
-        # but a very high count could indicate queue truncation
-        orphan_sync_log = conn.execute(
+        orphan_sync_log = probe.execute(
             "SELECT COUNT(*) FROM outbox_sync_log "
             "WHERE namespace = ? AND seq > ?",
             [ns, max_queue_seq],
         ).fetchone()[0]
+    finally:
+        probe.close()
 
-    ok = chain_ok and seq_continuous and timestamps_monotonic
+    ok = chain_ok and seq_continuous and timestamps_monotonic and not chain_forked
     return TableVerifyResult(
-        table=ns,
-        db_path=db_path,
+        table=label,
+        db_path=str(db_path),
         ok=ok,
         pending_count=pending_count,
         total_rows=total_rows,
         sync_log_rows=sync_log_rows,
-        chain_ok=chain_ok,
+        chain_ok=chain_ok and not chain_forked,
         chain_gaps=tuple(chain_gaps_list),
         seq_continuous=seq_continuous,
         seq_range=seq_range,
@@ -213,6 +264,58 @@ def verify_outbox(outbox: Outbox) -> TableVerifyResult:
         orphan_sync_log=orphan_sync_log,
         errors=tuple(errors),
     )
+
+
+def _verify_chain_rows(
+    conn: "sqlite3.Connection", namespace: str, rows: list,
+) -> tuple[bool, list[int]]:
+    """Read-only re-implementation of Outbox.verify_chain over an open conn.
+
+    We cannot call ``Outbox.verify_chain`` here: that method opens its own
+    WRITABLE ``thread_conn`` (and would construct an Outbox via open_write_conn,
+    migrating the file). The chain rule is identical to ``_outbox.verify_chain``:
+        - consecutive rows must satisfy rows[i].prev_seq == rows[i-1].seq
+        - the head's predecessor (if any) must be ACCOUNTED — present in
+          outbox_queue OR outbox_sync_log (and outbox_dead_log when present).
+    """
+    if not rows:
+        return True, []
+    missing: list[int] = []
+    for i, row in enumerate(rows):
+        if i == 0:
+            if row.prev_seq is not None and not _seq_accounted_ro(conn, row.prev_seq):
+                missing.append(row.prev_seq)
+        else:
+            expected_prev = rows[i - 1].seq
+            if row.prev_seq != expected_prev:
+                missing.append(expected_prev)
+    return len(missing) == 0, missing
+
+
+def _seq_accounted_ro(conn: "sqlite3.Connection", seq: int) -> bool:
+    """True if seq exists in outbox_queue OR outbox_sync_log (read-only).
+
+    Also consults outbox_dead_log when that table exists (Plan 2 / WS-2),
+    matching Outbox._seq_accounted's broadened rule. Detect the table via
+    sqlite_master so this works on DBs created before WS-2.
+    """
+    has_dead = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox_dead_log'"
+    ).fetchone()
+    if has_dead:
+        return bool(conn.execute(
+            "SELECT 1 FROM outbox_queue WHERE seq = ? "
+            "UNION SELECT 1 FROM outbox_sync_log WHERE seq = ? "
+            "UNION SELECT 1 FROM outbox_dead_log WHERE seq = ? "
+            "LIMIT 1",
+            [seq, seq, seq],
+        ).fetchone())
+    return bool(conn.execute(
+        "SELECT 1 FROM outbox_queue WHERE seq = ? "
+        "UNION SELECT 1 FROM outbox_sync_log WHERE seq = ? "
+        "LIMIT 1",
+        [seq, seq],
+    ).fetchone())
 
 
 def verify_all(outboxes: dict[str, Outbox]) -> VerifyResult:

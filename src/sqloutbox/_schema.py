@@ -172,6 +172,31 @@ def thread_conn(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def open_read_conn(db_path: Path) -> sqlite3.Connection:
+    """Open a SQLite connection in TRUE read-only mode for inspection.
+
+    Unlike ``open_write_conn``/``thread_conn`` this NEVER:
+        - creates the parent directory (no ``mkdir``),
+        - creates the file (``mode=ro`` fails on a missing path),
+        - runs DDL (``CREATE TABLE`` / ``ALTER`` / ``CREATE INDEX``),
+        - switches journal mode (no ``PRAGMA journal_mode=WAL`` write).
+
+    Used by the verify/diagnostic path so inspecting a ``.db`` file — or a
+    stray non-outbox file — can never mutate it (spec §6.1, F005/F050).
+
+    A missing file raises ``sqlite3.OperationalError`` on first statement
+    execution (SQLite opens lazily). Callers that want a soft "not found"
+    must catch it — see ``_verify.verify_db_path``.
+    """
+    # uri=True enables the file: URI form; mode=ro forbids any write and
+    # forbids creating the file if it does not exist.
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # busy_timeout is harmless on a read-only handle (readers don't take the
+    # write lock) but keeps behaviour uniform with the write path.
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    return conn
+
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:

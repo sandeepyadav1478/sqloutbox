@@ -58,8 +58,8 @@ from importlib.metadata import version as _pkg_version
 
 __version__ = _pkg_version("sqloutbox")
 
-from sqloutbox._models import QueueRow
-from sqloutbox._outbox import Outbox
+from sqloutbox._models import NamespaceHealth, QueueRow
+from sqloutbox._outbox import Outbox, health_all
 from sqloutbox._registry import shared_outbox, clear_registry
 from sqloutbox._worker import OutboxWorker
 from sqloutbox.config import OutboxConfig, TargetConfig
@@ -80,6 +80,8 @@ __all__ = [
     "Outbox",
     "OutboxWorker",
     "QueueRow",
+    "NamespaceHealth",
+    "health_all",
     "shared_outbox",
     "clear_registry",
     # Configuration

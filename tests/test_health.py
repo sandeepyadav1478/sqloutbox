@@ -134,3 +134,71 @@ def test_health_never_calls_back_into_app(tmp_path: Path):
                   h.last_error, h.last_error_class, h.last_attempt_at,
                   h.capacity_pct):
         assert value is None or isinstance(value, (int, float, str, bool))
+
+
+def test_health_all_one_namespace_per_file(tmp_path: Path):
+    """health_all returns one snapshot per file (namespace == file stem)."""
+    from sqloutbox._outbox import health_all
+
+    Outbox(db_path=tmp_path / "alpha.db", namespace="alpha").enqueue(
+        "INSERT INTO alpha (a) VALUES (?)", b"[1]"
+    )
+    Outbox(db_path=tmp_path / "beta.db", namespace="beta").enqueue(
+        "INSERT INTO beta (a) VALUES (?)", b"[1]"
+    )
+    Outbox(db_path=tmp_path / "beta.db", namespace="beta").enqueue(
+        "INSERT INTO beta (a) VALUES (?)", b"[2]"
+    )
+
+    healths = health_all(tmp_path)
+    by_ns = {h.namespace: h for h in healths}
+    assert set(by_ns) == {"alpha", "beta"}
+    assert by_ns["alpha"].depth == 1
+    assert by_ns["beta"].depth == 2
+    assert [h.namespace for h in healths] == ["alpha", "beta"]
+
+
+def test_health_all_missing_dir_returns_empty(tmp_path: Path):
+    """A non-existent db_dir yields an empty list, never raises."""
+    from sqloutbox._outbox import health_all
+    assert health_all(tmp_path / "does_not_exist") == []
+
+
+def test_health_all_capacity_pct_when_max_pending_set(tmp_path: Path):
+    """capacity_pct = depth / max_pending when passed; None otherwise."""
+    from sqloutbox._outbox import health_all
+
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    for i in range(4):
+        ob.enqueue("INSERT INTO evt (a) VALUES (?)", f"[{i}]".encode())
+
+    h_none = health_all(tmp_path)[0]
+    assert h_none.capacity_pct is None
+
+    h_set = health_all(tmp_path, max_pending=10)[0]
+    assert h_set.depth == 4
+    assert h_set.capacity_pct == 0.4
+
+
+def test_health_all_cross_process_read_while_writing(tmp_path: Path):
+    """A second connection reads correct depth while writer conn is open."""
+    from sqloutbox._outbox import health_all
+
+    writer_ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    writer_ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+    writer_ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[2]")
+
+    healths = health_all(tmp_path)
+    assert healths[0].depth == 2
+
+    writer_ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[3]")
+    assert health_all(tmp_path)[0].depth == 3
+
+
+def test_namespace_health_and_health_all_exported():
+    """Public API: NamespaceHealth and health_all importable from package root."""
+    import sqloutbox
+    assert hasattr(sqloutbox, "NamespaceHealth")
+    assert hasattr(sqloutbox, "health_all")
+    assert "NamespaceHealth" in sqloutbox.__all__
+    assert "health_all" in sqloutbox.__all__

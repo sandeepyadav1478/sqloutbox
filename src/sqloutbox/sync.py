@@ -369,6 +369,10 @@ class OutboxSyncService:
         self._flush_interval = config.flush_interval
         self._cycle_count = 0
 
+        # WS-6 log hygiene (F040/F041): namespaces currently in the "stuck" state.
+        # WARN once on the not-stuck → stuck transition; INFO once on recovery.
+        self._stuck_namespaces: set[str] = set()
+
         # WS-4 §5.2: cooperative shutdown. request_stop() sets this; the worker
         # checks it at the TOP of each cycle and returns cleanly (no new cycle).
         self._stopping = asyncio.Event()
@@ -979,17 +983,26 @@ class OutboxSyncService:
                             "attempts: %s",
                             table, seq, attempts_now, err,
                         )
-                    # Namespace unblocks — but we deliberately do NOT continue
-                    # confirming rows that were sent AFTER this one in the same
-                    # batch: they were fetched assuming this head; let the next
-                    # cycle re-fetch from the (now advanced) head in clean order.
+                    # Namespace unblocks — clear stuck state so a later re-stick re-WARNs.
+                    self._stuck_namespaces.discard(table)
+                    # We deliberately do NOT continue confirming rows sent AFTER this one
+                    # in the same batch: let the next cycle re-fetch from the new head.
                     total_failed += 1
                     break
                 else:
-                    logger.warning(
+                    # Per-retry detail → DEBUG (the backoff gate already paces these).
+                    logger.debug(
                         "[outbox_sync] %s '%s' seq=%d held (attempt %d, class=%s): %s",
                         target_name, table, seq, attempts_now, err_class, err,
                     )
+                    # F040/F041: WARN ONCE on the not-stuck → stuck transition.
+                    if table not in self._stuck_namespaces:
+                        self._stuck_namespaces.add(table)
+                        logger.warning(
+                            "[outbox_sync] namespace stuck: '%s' on target '%s' "
+                            "(head seq=%d, attempt %d, class=%s): %s",
+                            table, target_name, seq, attempts_now, err_class, err,
+                        )
                     total_failed += 1
                     break
 
@@ -1004,6 +1017,13 @@ class OutboxSyncService:
 
                 await asyncio.shield(_confirm())
                 total_confirmed += len(confirmed)
+                # F041: if this namespace was stuck and now delivered, it has recovered.
+                if table in self._stuck_namespaces:
+                    self._stuck_namespaces.discard(table)
+                    logger.info(
+                        "[outbox_sync] namespace recovered: '%s' on target '%s'",
+                        table, target_name,
+                    )
                 if logger.isEnabledFor(_VERBOSE):
                     logger.log(
                         _VERBOSE,

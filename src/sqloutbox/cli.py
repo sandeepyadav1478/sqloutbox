@@ -646,6 +646,88 @@ def cmd_verify(config_path: Path | None, db_dir_path: Path | None) -> None:
     sys.exit(0 if result.ok else 1)
 
 
+# ── status command ────────────────────────────────────────────────────────────
+
+
+def cmd_status(config_path: Path | None, db_dir_path: Path | None) -> None:
+    """Print per-namespace queue health (depth / oldest / stuck), read-only.
+
+    Two modes (mirrors ``verify``):
+
+    1. ``--config outbox.toml`` — discover db_dirs from TOML targets
+    2. ``--db-dir /path/to/data`` — scan one directory for ``*.db`` files
+
+    Reads the WS-6 ``health_all()`` signal. PURE READ — never mutates state,
+    never starts a drain. Exits 0 always when a source is given (status is
+    informational); exits 1 only when no source is provided.
+    """
+    from sqloutbox._outbox import health_all
+
+    db_dirs: list[Path] = []
+
+    if config_path is not None:
+        from sqloutbox._runner import load_config_toml
+        config, _writers = load_config_toml(config_path)
+        seen: set[str] = set()
+        for target in config.targets:
+            db_dir = target.db_dir or config.db_dir
+            key = str(db_dir)
+            if key not in seen:
+                seen.add(key)
+                db_dirs.append(db_dir)
+
+    elif db_dir_path is not None:
+        if not db_dir_path.is_dir():
+            print(f"error: not a directory: {db_dir_path}", file=sys.stderr)
+            sys.exit(1)
+        db_dirs.append(db_dir_path)
+
+    else:
+        print(
+            "error: provide --config <file.toml> or --db-dir <path>\n\n"
+            "Usage:\n"
+            "  sqloutbox status --config outbox.toml\n"
+            "  sqloutbox status --db-dir /path/to/data",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    healths = []
+    for db_dir in db_dirs:
+        healths.extend(health_all(db_dir))
+
+    if not healths:
+        print("no namespaces found — nothing to report")
+        sys.exit(0)
+
+    print()
+    print("sqloutbox status — per-namespace queue health")
+    print("-" * 70)
+    total_depth = 0
+    stuck_count = 0
+    for h in healths:
+        total_depth += h.depth
+        state = "STUCK" if h.is_stuck else "ok"
+        if h.is_stuck:
+            stuck_count += 1
+        line = (
+            f"  {h.namespace:<30s}  {state:<5s}  "
+            f"depth={h.depth}  attempts={h.head_attempts}"
+        )
+        if h.last_error_class:
+            line += f"  class={h.last_error_class}"
+        print(line)
+        if h.is_stuck and h.last_error:
+            print(f"  {'':<30s}         last_error={h.last_error}")
+    print("-" * 70)
+    print(
+        f"  {len(healths)} namespace(s)  "
+        f"total_depth={total_depth}  stuck={stuck_count}"
+    )
+    print()
+    sys.exit(0)
+
+
 # ── dead-letter / skip commands ───────────────────────────────────────────────
 
 
@@ -836,6 +918,19 @@ def main(argv: list[str] | None = None) -> None:
     p_skip.add_argument("--seq", "-s", type=int, default=None, required=False,
                         help="seq of the stuck head row to skip")
 
+    p_status = sub.add_parser(
+        "status",
+        help="show per-namespace queue depth / stuck state (read-only)",
+    )
+    p_status.add_argument(
+        "--config", "-c", type=Path, default=None, dest="status_config",
+        help="TOML config file (discover db_dirs from targets)",
+    )
+    p_status.add_argument(
+        "--db-dir", "-d", type=Path, default=None, dest="status_db_dir",
+        help="directory to scan for *.db files",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -852,3 +947,5 @@ def main(argv: list[str] | None = None) -> None:
         cmd_dead_letter(args.dl_config, args.dl_action, args.namespace, args.seq)
     elif args.command == "skip":
         cmd_skip(args.skip_config, args.namespace, args.seq)
+    elif args.command == "status":
+        cmd_status(args.status_config, args.status_db_dir)

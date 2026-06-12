@@ -64,3 +64,28 @@ def test_version_is_0_5_0():
         pytest.skip("repo root not found (running from a built dist, not a checkout)")
     text = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'version = "0.5.0"' in text
+
+
+def test_changelog_exists_and_documents_0_5_0():
+    """CHANGELOG.md ships and has a 0.5.0 entry naming the headline changes."""
+    if _REPO_ROOT is None:
+        pytest.skip("repo root not found (running from a built dist, not a checkout)")
+    cl = _REPO_ROOT / "CHANGELOG.md"
+    assert cl.exists()
+    text = cl.read_text(encoding="utf-8")
+    assert "0.5.0" in text
+    assert "at-least-once" in text.lower()
+    assert "dead-letter" in text.lower() or "dead letter" in text.lower()
+    assert "health" in text.lower()
+
+
+def test_contributing_documents_quality_gates():
+    """CONTRIBUTING.md documents the ruff / mypy / pytest gates."""
+    if _REPO_ROOT is None:
+        pytest.skip("repo root not found (running from a built dist, not a checkout)")
+    cg = _REPO_ROOT / "CONTRIBUTING.md"
+    assert cg.exists()
+    text = cg.read_text(encoding="utf-8").lower()
+    assert "ruff" in text
+    assert "mypy" in text
+    assert "pytest" in text

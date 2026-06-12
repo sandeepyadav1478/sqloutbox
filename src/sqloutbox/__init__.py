@@ -58,8 +58,8 @@ from importlib.metadata import version as _pkg_version
 
 __version__ = _pkg_version("sqloutbox")
 
-from sqloutbox._models import QueueRow
-from sqloutbox._outbox import Outbox
+from sqloutbox._models import NamespaceHealth, QueueRow
+from sqloutbox._outbox import Outbox, health_all
 from sqloutbox._registry import shared_outbox, clear_registry
 from sqloutbox._worker import OutboxWorker
 from sqloutbox.config import OutboxConfig, TargetConfig
@@ -67,12 +67,21 @@ from sqloutbox.middleware import SQLMiddleware
 from sqloutbox.sync import OutboxSyncService, OutboxWriter, inject_outbox_seq
 from sqloutbox._runner import load_config_toml
 from sqloutbox._verify import TableVerifyResult, VerifyResult, verify_all, verify_outbox
+from sqloutbox.exceptions import (
+    ChainIntegrityError,
+    ConfigError,
+    QueueFullError,
+    SqloutboxError,
+    UnsupportedStatementError,
+)
 
 __all__ = [
     # Core queue
     "Outbox",
     "OutboxWorker",
     "QueueRow",
+    "NamespaceHealth",
+    "health_all",
     "shared_outbox",
     "clear_registry",
     # Configuration
@@ -90,4 +99,10 @@ __all__ = [
     "VerifyResult",
     "verify_outbox",
     "verify_all",
+    # Exceptions
+    "SqloutboxError",
+    "ConfigError",
+    "QueueFullError",
+    "UnsupportedStatementError",
+    "ChainIntegrityError",
 ]

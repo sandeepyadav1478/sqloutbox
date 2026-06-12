@@ -4,8 +4,10 @@ A durable, config-driven SQLite transactional outbox for Python. Zero external
 dependencies (stdlib only). Designed for single-process deployments with asyncio.
 
 **Producer** writes SQL events synchronously to a local SQLite file (~150µs,
-no network). **Consumer** drains them to N remote databases in strict order,
-with singly-linked chain integrity verification on every batch.
+no network). **Consumer** drains them to N remote databases with **at-least-once**
+delivery and per-namespace head-of-line ordering, verifying singly-linked chain
+integrity on every batch. See [Delivery guarantees](#delivery-guarantees) for
+the exact contract.
 
 ## Installation
 
@@ -213,6 +215,33 @@ db_token = "${DB_TOKEN}"
 
 This calls `TursoWriter(db_url="...", db_token="...")`.
 
+### Supported SQL grammar for `inject_outbox_seq`
+
+When a target has `inject_outbox_seq` enabled, the drain rewrites each row's
+SQL to carry the `outbox_seq` column. The rewrite uses a conservative,
+string-literal-aware lexer that accepts **only** two shapes:
+
+```sql
+-- single-row INSERT with an explicit column list:
+INSERT INTO t (c1, c2) VALUES (?, ?)
+    -- → INSERT OR IGNORE INTO t (c1, c2, outbox_seq) VALUES (?, ?, ?)
+
+-- UPDATE with at least one real bind placeholder in SET:
+UPDATE t SET c1=?, c2=? WHERE id=?
+    -- → UPDATE t SET c1=?, c2=?, outbox_seq = ? WHERE id=?
+```
+
+Everything else is **rejected loudly** with `UnsupportedStatementError`
+(never silently rewritten):
+
+- `INSERT … SELECT …` (no `VALUES` list)
+- multi-row `INSERT … VALUES (…), (…)`
+- a `?`, `)`, or `WHERE` that appears **inside a quoted string literal**
+- an `UPDATE` whose only `?` is inside a literal (no real SET placeholder)
+
+If you must deliver an unsupported shape, route its table to a target with
+`inject_outbox_seq=False` (delivered verbatim, no rewrite).
+
 ### Programmatic TOML loading
 
 ```python
@@ -254,10 +283,42 @@ config = OutboxConfig(
 
 Each outbox row stores `prev_seq` — a backward pointer to the previous row.
 Before every delivery, `verify_chain()` validates the chain is unbroken.
-A gap blocks delivery and logs an error (never silently drops events).
+A *local* chain gap blocks delivery and logs an error. A row the remote can
+never accept is retried with backoff and, after `max_attempts`, **moved** (not
+deleted) to the audited `outbox_dead_log` table. Nothing is silently dropped —
+see [Delivery guarantees](#delivery-guarantees).
 
 After delivery, rows are recorded in `outbox_sync_log` so future gap checks
 can confirm the row was delivered, not lost.
+
+### Backpressure (`max_pending`) and the stop-producing watermark
+
+`sqloutbox` is **unbounded by default** — `enqueue()` never raises and the
+queue grows until the drain catches up. `health().depth` (per namespace)
+surfaces the backlog so you can monitor it.
+
+To bound the queue, set `max_pending` on the config. It is a **two-tier,
+pull-based** model — the library only ever *reports a number*; it never calls
+back into your app, never pauses it, and never resumes it:
+
+| Tier | Who acts | Trigger | Action |
+|------|----------|---------|--------|
+| **Stop watermark (80%)** | your **producing application** | `depth >= 80% * max_pending` (polled) | the producer stops enqueuing |
+| **Hard cap (100%)** | the **library** | `enqueue()` while `pending >= max_pending` | raises `QueueFullError(namespace, max_pending)` |
+
+The **80% `STOP_WATERMARK_PCT` is a producing-application policy, not library
+config** — the library does not own "80". Your producer polls `health().depth`
+(Plan 6 adds a derived `capacity_pct = depth / max_pending` convenience) and
+stops enqueuing at its own threshold; the `QueueFullError` hard cap is the
+library backstop for a bare producer that does not poll.
+
+**There is no auto-resume — deliberately.** A fast-rising backlog is a
+*symptom*: the cause may be a slow/down remote (the drain will clear it) OR a
+**bug in the producer itself** flooding wrong messages. Auto-resuming would
+re-arm a faulty producer. So once the producer stops, an **operator restarts
+it manually** after diagnosing why the queue filled (and may quarantine the
+already-queued bad rows via the dead-letter CLI). sqloutbox's drain service
+**never stops or starts** — it keeps draining the backlog down throughout.
 
 ### Idempotent delivery
 
@@ -420,8 +481,12 @@ Standalone helper — transforms an INSERT into an idempotent
 ## CLI
 
 ```
-sqloutbox runservice [--config FILE]  Start drain from TOML config
-sqloutbox init [DIR]                  Scaffold a Python config directory
+sqloutbox runservice [--config FILE]            Start drain from TOML config
+sqloutbox init [DIR]                            Scaffold a Python config directory
+sqloutbox verify  [--config FILE | --db-dir D]  Offline integrity scan (read-only)
+sqloutbox status  [--config FILE | --db-dir D]  Per-namespace depth / stuck (read-only)
+sqloutbox dead-letter {list,show,replay} …      Inspect / replay quarantined rows
+sqloutbox skip --namespace N --seq S …          Move a stuck head to the dead-letter
 ```
 
 Recommended: create an `outbox.toml` and run `sqloutbox runservice`.
@@ -476,13 +541,115 @@ INSERT OR IGNORE INTO outbox_sync_log (seq, namespace, synced_at)
 VALUES (<lost_seq>, '<namespace>', datetime('now'));
 ```
 
+## Delivery guarantees
+
+Read this before relying on sqloutbox for anything important. These are the
+*true* guarantees as of 0.5.0 — stated precisely so there are no surprises.
+
+### At-least-once delivery
+
+sqloutbox is **at-least-once**, not exactly-once. The drain delivers a batch
+(`writer.write_batch`), then records the rows as synced and deletes them. If
+the process crashes **between** the remote write and the local delete, those
+rows are redelivered on restart. This is unavoidable for a durable queue
+without a distributed transaction across the two databases.
+
+**Make delivery idempotent** by setting `inject_outbox_seq=True` (the default).
+The drain rewrites each INSERT to `INSERT OR IGNORE ... (..., outbox_seq)` and
+the remote's partial unique index on `outbox_seq` absorbs the duplicate. Without
+`inject_outbox_seq=True`, a redelivery applies the statement again — for a
+non-idempotent UPDATE, that may be incorrect. **Idempotency is only guaranteed
+with `inject_outbox_seq=True` on idempotent INSERTs.**
+
+### Ordering
+
+Delivery is **strictly head-of-line ordered within a namespace**. When the head
+row (lowest unsynced `seq`) fails, it is held and the rows behind it are *not*
+delivered until it succeeds, is dead-lettered, or is skipped. Earlier versions
+confirmed rows independently, letting a later row leapfrog a failed earlier one
+— that is fixed in 0.5.0.
+
+- **No cross-namespace ordering.** Each namespace (table) has its own chain and
+  its own backoff clock; they drain independently.
+- A persistently failing head retries with **exponential backoff**
+  (`2^attempts` minutes, capped at `backoff_cap_minutes`, default 64).
+
+### Poison rows — auto dead-letter (move, not drop)
+
+After `max_attempts` failed deliveries (default 10; set `None` to retry
+forever), the head row is **moved atomically** to the `outbox_dead_log` table
+with the failure reason, and the namespace advances so it is no longer blocked.
+The row is **never lost** — it is quarantined, auditable, and replayable:
+
+```bash
+sqloutbox dead-letter list  --config outbox.toml            # what's quarantined
+sqloutbox dead-letter show  --config outbox.toml --namespace N --seq S
+sqloutbox dead-letter replay --config outbox.toml --namespace N --seq S
+sqloutbox skip   --config outbox.toml --namespace N --seq S   # move a stuck head
+```
+
+An undecodable payload or an SQL shape `inject_outbox_seq` cannot transform is
+dead-lettered immediately (it can never succeed).
+
+### Observing health (pull, never push)
+
+The library exposes a **read-only** signal you poll; it never calls back into
+your app, never pauses anything:
+
+```python
+from sqloutbox import health_all
+from pathlib import Path
+
+for h in health_all(Path("data/myapp")):
+    print(h.namespace, h.depth, h.is_stuck, h.head_attempts, h.last_error_class)
+```
+
+`NamespaceHealth` fields: `namespace`, `depth`, `head_attempts`, `is_stuck`,
+`last_error`, `last_error_class`, `last_attempt_at`, and `capacity_pct`
+(`depth / max_pending`, or `None` when `max_pending` is unset). The CLI prints
+the same data:
+
+```bash
+sqloutbox status --db-dir data/myapp
+sqloutbox status --config outbox.toml
+```
+
+**Backpressure is your decision, not the library's.** Set `max_pending` to cap
+the queue: `enqueue()` then raises `QueueFullError` at the hard wall. To stop
+*earlier* (recommended), have your **producing application** poll `health()`
+and stop producing at, say, 80% of `max_pending` — that 80% watermark lives in
+*your* app, not in library config. The library only reports the number; it
+never halts or resumes your producer (an operator restarts it after diagnosing
+*why* the queue filled). sqloutbox's own drain never stops — it keeps pulling
+the backlog down.
+
+### Single drain per `db_dir`
+
+**Run exactly one drain process per `db_dir`.** `runservice` takes an exclusive
+`flock` on `<db_dir>/.sqloutbox.lock` at startup and exits with a clear error if
+another drain already holds it. Two drains on one `db_dir` would double-deliver.
+Producers (`enqueue`) do **not** take this lock — many producers + one drain is
+the supported topology.
+
 ## Limitations
 
-- **Single process only** — one write connection per SQLite file
-- **UTF-8 payloads only** — payload stored as TEXT
-- **No TTL/expiry** — rows stay until explicitly deleted
-- **No priorities** — strictly FIFO per namespace
-- **No cross-namespace ordering** — each namespace is independent
+- **At-least-once, not exactly-once** — a crash between remote write and local
+  delete can redeliver. Use `inject_outbox_seq=True` for idempotent absorption
+  (see [Delivery guarantees](#delivery-guarantees)).
+- **Idempotency only with `inject_outbox_seq=True`** — a non-idempotent UPDATE
+  routed without injection may be applied twice on redelivery.
+- **One drain per `db_dir`** — enforced by a `flock`; a second `runservice`
+  exits. Many producers, one drain.
+- **One write connection per SQLite file** — `enqueue()` is single-writer per
+  namespace file.
+- **UTF-8 payloads only** — payload is stored as TEXT; non-UTF-8 bytes are
+  rejected/dead-lettered.
+- **No TTL/expiry** — rows stay until delivered, dead-lettered, or skipped.
+- **No priorities** — strictly FIFO per namespace, head-of-line held on failure.
+- **No cross-namespace ordering** — each namespace drains independently with its
+  own backoff clock.
+- **`tag` is raw SQL you control** — sqloutbox executes it verbatim at the
+  remote. Never put untrusted input in `tag`; parameterise via `args`.
 
 ## License
 

@@ -1,0 +1,476 @@
+"""WS-5: read-only verify, crash-safe forked-chain migration, producer seed."""
+from __future__ import annotations
+
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from sqloutbox._outbox import Outbox
+
+
+def _enqueue_n(outbox: Outbox, n: int) -> list[int]:
+    """Enqueue n rows and return their seqs (mirrors tests/test_verify.py)."""
+    seqs = []
+    for i in range(n):
+        seq = outbox.enqueue(
+            tag="INSERT INTO events (id) VALUES (?)",
+            payload=f"[{i}]".encode(),
+            source="test",
+        )
+        assert seq is not None
+        seqs.append(seq)
+    return seqs
+
+
+def _journal_mode(db_path: Path) -> str:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ── open_read_conn: truly read-only ────────────────────────────────────────
+
+
+def test_open_read_conn_cannot_write(tmp_path: Path):
+    """A read-only connection refuses writes (proves mode=ro)."""
+    from sqloutbox._schema import open_read_conn, open_write_conn
+
+    db = tmp_path / "events.db"
+    open_write_conn(db).close()  # create a real outbox DB first
+
+    conn = open_read_conn(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO outbox_queue (created_at, namespace, tag, payload) "
+                         "VALUES ('x','n','t','p')")
+    finally:
+        conn.close()
+
+
+def test_open_read_conn_missing_file_not_created(tmp_path: Path):
+    """Opening a missing path read-only must NOT create the file."""
+    from sqloutbox._schema import open_read_conn
+
+    missing = tmp_path / "nope.db"
+    with pytest.raises(sqlite3.OperationalError):
+        conn = open_read_conn(missing)
+        # The error fires on first access for a missing file.
+        conn.execute("SELECT 1 FROM outbox_queue").fetchone()
+    assert not missing.exists()
+
+
+# ── verify_db_path: inspection-by-path ──────────────────────────────────────
+
+
+def test_verify_db_path_missing_reports_not_an_outbox(tmp_path: Path):
+    """verify on a missing path reports 'not an outbox DB', does NOT create it."""
+    from sqloutbox._verify import verify_db_path
+
+    missing = tmp_path / "ghost.db"
+    result = verify_db_path(missing)
+    assert result.ok is False
+    assert any("not an outbox" in e.lower() for e in result.errors)
+    assert not missing.exists()
+
+
+def test_verify_db_path_foreign_file_reports_not_an_outbox(tmp_path: Path):
+    """A real SQLite file with no outbox_queue table is reported, not migrated."""
+    from sqloutbox._verify import verify_db_path
+
+    foreign = tmp_path / "foreign.db"
+    c = sqlite3.connect(str(foreign))
+    c.execute("CREATE TABLE unrelated (x)")
+    c.commit()
+    c.close()
+    mtime_before = os.path.getmtime(foreign)
+
+    result = verify_db_path(foreign)
+    assert result.ok is False
+    assert any("not an outbox" in e.lower() for e in result.errors)
+    # File was NOT migrated (no outbox_queue table added, mtime unchanged).
+    c2 = sqlite3.connect(f"file:{foreign}?mode=ro", uri=True)
+    tables = {r[0] for r in c2.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    c2.close()
+    assert "outbox_queue" not in tables
+    assert os.path.getmtime(foreign) == mtime_before
+
+
+def test_verify_db_path_existing_db_unchanged(tmp_path: Path):
+    """verify on a healthy DB does not switch journal_mode or change the file."""
+    from sqloutbox._verify import verify_db_path
+
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="events")
+    _enqueue_n(ob, 4)
+    ob._write_conn.close()  # release the writer so we can snapshot cleanly
+
+    # Snapshot: journal mode + set of sidecar files + mtime.
+    jm_before = _journal_mode(db)
+    files_before = sorted(p.name for p in tmp_path.iterdir())
+    mtime_before = os.path.getmtime(db)
+
+    result = verify_db_path(db)
+    assert result.ok is True
+    assert result.table == "events"
+    assert result.total_rows == 4
+
+    # Nothing changed: same journal mode, same files, same mtime.
+    assert _journal_mode(db) == jm_before
+    assert sorted(p.name for p in tmp_path.iterdir()) == files_before
+    assert os.path.getmtime(db) == mtime_before
+
+
+# ── Forked-chain migration ──────────────────────────────────────────────────
+
+
+def _build_forked_db(db_path: Path) -> None:
+    """Hand-build an outbox DB with two rows sharing the same prev_seq (a fork).
+
+    We create the queue table WITHOUT the UNIQUE constraint / index so the fork
+    can be inserted, then leave the file for open_write_conn to migrate — that
+    is exactly the upgrade path that must fail safely.
+
+    We ALSO create an (empty) ``outbox_sync_log`` table. A real forked
+    production DB always has it — ``open_write_conn`` creates ``outbox_sync_log``
+    (line ~90) BEFORE the UNIQUE-index creation that crashes (line ~92), so any
+    DB old enough to fork already carries the sync_log table. Without it, the
+    read-only ``verify_db_path`` (which SELECTs from ``outbox_sync_log``) would
+    raise ``OperationalError: no such table`` instead of REPORTING the fork —
+    breaking ``test_forked_db_read_only_verify_reports_without_crashing``.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE outbox_queue ("
+        "  seq        INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  created_at TEXT    NOT NULL,"
+        "  namespace  TEXT    NOT NULL,"
+        "  source     TEXT    NOT NULL DEFAULT '',"
+        "  tag        TEXT    NOT NULL,"
+        "  payload    TEXT    NOT NULL,"
+        "  prev_seq   INTEGER,"
+        "  synced     INTEGER NOT NULL DEFAULT 0"
+        ")"
+    )
+    # Mirror the real schema: open_write_conn creates outbox_sync_log before the
+    # UNIQUE-index migration, so a real forked DB always has this table.
+    conn.execute(
+        "CREATE TABLE outbox_sync_log ("
+        "  seq       INTEGER PRIMARY KEY,"
+        "  namespace TEXT    NOT NULL,"
+        "  synced_at TEXT    NOT NULL"
+        ")"
+    )
+    # seq=1 head (prev_seq NULL), then TWO rows both pointing at seq=1 → fork.
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (1, '2026-01-01T00:00:00+00:00', 'evt', 't', 'a', NULL)")
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (2, '2026-01-01T00:00:01+00:00', 'evt', 't', 'b', 1)")
+    conn.execute("INSERT INTO outbox_queue (seq, created_at, namespace, tag, payload, prev_seq) "
+                 "VALUES (3, '2026-01-01T00:00:02+00:00', 'evt', 't', 'c', 1)")
+    conn.commit()
+    conn.close()
+
+
+def test_forked_db_open_write_conn_raises_chain_integrity_error(tmp_path: Path):
+    """open_write_conn on a forked DB raises typed ChainIntegrityError, not IntegrityError."""
+    from sqloutbox._schema import open_write_conn
+    from sqloutbox.exceptions import ChainIntegrityError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    with pytest.raises(ChainIntegrityError) as ei:
+        open_write_conn(db)
+    msg = str(ei.value)
+    assert "prev_seq" in msg
+    assert "1" in msg            # names the duplicated prev_seq value
+    assert "recover" in msg.lower() or "skip" in msg.lower()  # recovery pointer
+
+
+def test_forked_db_outbox_init_raises_chain_integrity_error(tmp_path: Path):
+    """Outbox.__init__ (producer hot path) raises ChainIntegrityError, not a bare crash."""
+    from sqloutbox.exceptions import ChainIntegrityError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    with pytest.raises(ChainIntegrityError):
+        Outbox(db_path=db, namespace="evt")
+
+
+def test_forked_db_chain_integrity_error_is_sqloutbox_error(tmp_path: Path):
+    """ChainIntegrityError is part of the SqloutboxError hierarchy (catchable broadly)."""
+    from sqloutbox._schema import open_write_conn
+    from sqloutbox.exceptions import ChainIntegrityError, SqloutboxError
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+    with pytest.raises(SqloutboxError):
+        open_write_conn(db)
+    assert issubclass(ChainIntegrityError, SqloutboxError)
+
+
+def test_forked_db_read_only_verify_reports_without_crashing(tmp_path: Path):
+    """Read-only verify OPENS and REPORTS the fork (does not raise) — diagnostic stays usable."""
+    from sqloutbox._verify import verify_db_path
+
+    db = tmp_path / "forked.db"
+    _build_forked_db(db)
+
+    # No exception — verify must remain usable on a DB that crashes the writer.
+    result = verify_db_path(db, namespace="evt")
+    assert result.ok is False
+    assert result.chain_ok is False
+    assert any("fork" in e.lower() for e in result.errors)
+
+
+# ── Producer-side seed (persisted high-water mark, mechanism (a)) ────────────
+
+
+def test_hwm_recorded_on_enqueue(tmp_path: Path):
+    """Each enqueue persists a per-namespace high-water mark in outbox_hwm."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    seqs = _enqueue_n(ob, 3)
+    assert ob._persisted_hwm() == max(seqs)
+
+
+def test_seed_sequence_persists_hwm(tmp_path: Path):
+    """The drain's seed_sequence (remote max) is persisted as a floor."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.seed_sequence(5000)
+    assert ob._persisted_hwm() == 5000
+
+
+def test_fresh_host_lazy_seed_from_persisted_hwm(tmp_path: Path):
+    """A NEW Outbox on the same file lazily seeds its counter from the persisted hwm.
+
+    Simulates: drain ran seed_sequence(remote_max) once; later the producer
+    process restarts and constructs a fresh Outbox — it must pick up the floor
+    and NOT restart numbering low.
+    """
+    db = tmp_path / "events.db"
+    # First instance learns the remote max (e.g. via the drain's _seed_from_remote).
+    first = Outbox(db_path=db, namespace="evt")
+    first.seed_sequence(10_000)
+    first._write_conn.close()
+
+    # Producer restarts: a brand-new Outbox on the same file.
+    producer = Outbox(db_path=db, namespace="evt")
+    seq = producer.enqueue("INSERT INTO evt (id) VALUES (?)", b"[1]")
+    assert seq is not None
+    assert seq > 10_000, f"producer must start above persisted hwm, got {seq}"
+
+
+def test_fresh_host_populated_remote_no_collision(tmp_path: Path):
+    """End-to-end mechanism (a): fresh local file + known remote max → no colliding seqs.
+
+    Reproduces the F004 collision scenario: the local file is fresh (counter
+    would start at 1), but we know the remote already holds outbox_seq 1..200.
+    After recording that high-water mark, the producer's enqueues all land
+    ABOVE 200, so INSERT OR IGNORE on the remote can never silently drop them.
+    """
+    db = tmp_path / "events.db"
+    remote_max = 200
+
+    # Producer-side seed from the persisted high-water mark (mechanism (a)):
+    # in production this floor is established by the drain's seed_sequence(remote_max)
+    # OR by a prior run; here we set it explicitly to model "populated remote".
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(remote_max)
+    # A fresh Outbox constructed afterwards lazily seeds from the persisted hwm.
+    ob2 = Outbox(db_path=db, namespace="evt")
+
+    seqs = [ob2.enqueue("INSERT INTO evt (id) VALUES (?)", f"[{i}]".encode())
+            for i in range(5)]
+    assert all(s is not None for s in seqs)
+    assert all(s > remote_max for s in seqs), \
+        f"all producer seqs must exceed remote max {remote_max}; got {seqs}"
+    # No value in 1..remote_max is reused → INSERT OR IGNORE cannot drop them.
+    assert not set(seqs) & set(range(1, remote_max + 1))
+
+
+def test_hwm_does_not_break_chain_integrity(tmp_path: Path):
+    """Persisted-hwm seeding leaves the singly-linked chain verifiable."""
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(9000)
+    ob2 = Outbox(db_path=db, namespace="evt")
+    ob2.enqueue_batch([("t", b"a"), ("t", b"b"), ("t", b"c")])
+    rows = ob2.fetch_unsynced()
+    ok, gaps = ob2.verify_chain(rows)
+    assert ok is True, f"chain must stay intact after hwm seed; gaps={gaps}"
+
+
+# ── Integration ──────────────────────────────────────────────────────────────
+
+
+def test_chain_integrity_error_importable_from_package():
+    """ChainIntegrityError (Plan 3) is importable — Task 2 depends on it."""
+    from sqloutbox.exceptions import (
+        ChainIntegrityError,
+        SqloutboxError,
+    )
+    assert issubclass(ChainIntegrityError, SqloutboxError)
+
+
+def test_seeded_producer_then_read_only_verify_clean(tmp_path: Path):
+    """A producer seeded above a remote floor verifies clean, read-only."""
+    from sqloutbox._verify import verify_db_path
+
+    db = tmp_path / "events.db"
+    ob = Outbox(db_path=db, namespace="evt")
+    ob.record_hwm(500)
+    producer = Outbox(db_path=db, namespace="evt")
+    producer.enqueue_batch([("INSERT INTO evt (id) VALUES (?)", f"[{i}]".encode())
+                            for i in range(4)])
+    producer._write_conn.close()
+
+    result = verify_db_path(db, namespace="evt")
+    assert result.ok is True
+    assert result.chain_ok is True
+    assert result.total_rows == 4
+    assert result.seq_range is not None
+    assert result.seq_range[0] > 500  # all seqs above the seeded floor
+
+
+def test_record_hwm_failure_does_not_roll_back_enqueue(tmp_path: Path):
+    """record_hwm failing after commit must NOT roll back or drop the enqueued row.
+
+    record_hwm is non-fatal by design: it has its own try/except that logs a
+    WARNING and returns. The critical invariant is that a failure there cannot
+    reach the enqueue() except block and trigger rollback + return None on an
+    already-committed row.
+
+    We simulate the failure by dropping the outbox_hwm table after the Outbox is
+    constructed (so the real record_hwm code path — with its own exception
+    swallowing — is exercised, not a monkeypatched stub).
+    """
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+
+    # Drop outbox_hwm so the next record_hwm call raises OperationalError internally.
+    ob._write_conn.execute("DROP TABLE outbox_hwm")
+    ob._write_conn.commit()
+
+    # enqueue must NOT raise and must NOT return None — the INSERT committed.
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+
+    # The row is committed and present in the queue despite the HWM failure.
+    assert seq is not None, (
+        "enqueue returned None — a record_hwm failure leaked into the enqueue "
+        "error path and either triggered rollback or masked the committed row"
+    )
+    assert ob.pending_count() == 1
+
+
+def test_enqueue_batch_hwm_is_highest_seq_in_batch(tmp_path: Path):
+    """enqueue_batch records the HWM as the LAST (highest) seq in the batch.
+
+    A batch of N items produces seqs [start, start+1, ..., start+N-1].
+    The persisted HWM must equal start+N-1 (the highest), not start (the first).
+    A bug that called record_hwm(start_seq) instead of record_hwm(last_seq) would
+    cause a fresh-host producer to start numbering from a too-low floor, risking
+    silent DROP on INSERT OR IGNORE for batch items after the first.
+    """
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seqs = ob.enqueue_batch([("t", b"a"), ("t", b"b"), ("t", b"c"), ("t", b"d")])
+    assert len(seqs) == 4
+    assert ob._persisted_hwm() == max(seqs), (
+        f"HWM must equal highest seq {max(seqs)}, got {ob._persisted_hwm()}"
+    )
+
+
+def test_persisted_hwm_returns_zero_when_outbox_hwm_table_absent(tmp_path: Path):
+    """_persisted_hwm returns 0 (never crashes) when the outbox_hwm table is absent.
+
+    Pre-WS-5 databases do not have the outbox_hwm table. The tolerance path
+    (except Exception: return 0) must fire silently so opening an old DB with a
+    fresh Outbox does not crash the hot path.
+    """
+    db = tmp_path / "old.db"
+    # Build a minimal outbox DB by hand — WITHOUT the outbox_hwm table.
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE outbox_queue ("
+        "  seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  created_at TEXT NOT NULL,"
+        "  namespace  TEXT NOT NULL,"
+        "  source     TEXT NOT NULL DEFAULT '',"
+        "  tag        TEXT NOT NULL,"
+        "  payload    TEXT NOT NULL,"
+        "  prev_seq   INTEGER UNIQUE,"
+        "  synced     INTEGER NOT NULL DEFAULT 0,"
+        "  attempts   INTEGER NOT NULL DEFAULT 0,"
+        "  last_attempt_at TEXT,"
+        "  last_error TEXT,"
+        "  last_error_class TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE outbox_sync_log ("
+        "  seq INTEGER PRIMARY KEY,"
+        "  namespace TEXT NOT NULL,"
+        "  synced_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE outbox_dead_log ("
+        "  seq INTEGER NOT NULL,"
+        "  namespace TEXT NOT NULL,"
+        "  tag TEXT NOT NULL,"
+        "  payload TEXT NOT NULL,"
+        "  prev_seq INTEGER,"
+        "  source TEXT,"
+        "  attempts INTEGER NOT NULL,"
+        "  last_error TEXT,"
+        "  last_error_class TEXT,"
+        "  dead_lettered_at TEXT NOT NULL,"
+        "  reason TEXT NOT NULL,"
+        "  PRIMARY KEY (namespace, seq)"
+        ")"
+    )
+    conn.commit()
+    conn.close()
+
+    # Outbox.__init__ opens a write connection; _seed_from_hwm calls _persisted_hwm.
+    # On a DB without outbox_hwm the SELECT raises OperationalError — must return 0.
+    # Constructing the Outbox must NOT raise, and _persisted_hwm must return 0.
+    ob = Outbox(db_path=db, namespace="evt")
+    assert ob._persisted_hwm() == 0
+
+
+def test_db_dir_verify_skips_foreign_and_missing(tmp_path: Path, capsys):
+    """CLI --db-dir scan: a foreign file is reported FAIL, a healthy outbox OK, neither mutated."""
+    from sqloutbox.cli import cmd_verify
+
+    # One healthy outbox file + one foreign sqlite file in the same dir.
+    Outbox(db_path=tmp_path / "good.db", namespace="good").enqueue(
+        "INSERT INTO good (id) VALUES (?)", b"[1]"
+    )
+    foreign = tmp_path / "foreign.db"
+    c = sqlite3.connect(str(foreign))
+    c.execute("CREATE TABLE x (a)")
+    c.commit()
+    c.close()
+    foreign_mtime = os.path.getmtime(foreign)
+
+    with pytest.raises(SystemExit) as ei:
+        cmd_verify(config_path=None, db_dir_path=tmp_path)
+    # Exit 1 because the foreign file fails ("not an outbox DB").
+    assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "good" in out
+    assert "FAIL" in out  # foreign.db reported, not migrated
+    # Foreign file untouched.
+    assert os.path.getmtime(foreign) == foreign_mtime
+    c2 = sqlite3.connect(f"file:{foreign}?mode=ro", uri=True)
+    tables = {r[0] for r in c2.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    c2.close()
+    assert "outbox_queue" not in tables

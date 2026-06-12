@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqloutbox"
-version = "0.4.1"
+version = "0.5.0"
 description = "Config-driven SQLite transactional outbox — multi-app TOML config, per-table injection control, .env/Doppler credential loading, multi-target sync daemon"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,13 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
     "Typing :: Typed",
 ]
-dependencies = []   # stdlib only — sqlite3, pathlib, dataclasses, logging, asyncio, json, tomllib (3.11+)
+dependencies = [
+    # stdlib only on 3.11+ (tomllib). On 3.10 the stdlib has no TOML parser,
+    # so ship tomli as a CONDITIONAL CORE dependency — TOML config is the
+    # headline feature and `pip install sqloutbox` must parse it on 3.10
+    # without the user opting into an extra (F021). Zero deps on 3.11+.
+    'tomli>=2.0; python_version < "3.11"',
+]
 
 [project.scripts]
 sqloutbox = "sqloutbox.cli:main"
@@ -47,8 +53,7 @@ packages = ["src/sqloutbox"]
 include = ["src/", "README.md", "LICENSE"]
 
 [project.optional-dependencies]
-toml = ["tomli>=2.0; python_version < '3.11'"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.4", "mypy>=1.8"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

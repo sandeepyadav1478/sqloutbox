@@ -301,3 +301,117 @@ def test_outbox_config_retain_default():
     """OutboxConfig retain_log_days defaults to 30."""
     cfg = OutboxConfig(db_dir=Path("/tmp"))
     assert cfg.retain_log_days == 30
+
+
+# ── WS-3: new fields + __post_init__ validation ──────────────────────────────
+
+from sqloutbox.exceptions import ConfigError
+
+
+def test_new_fields_defaults_outbox():
+    """OutboxConfig gains max_attempts=10, max_pending=None, max_batch_bytes=None."""
+    cfg = OutboxConfig(db_dir=Path("/tmp"))
+    assert cfg.max_attempts == 10
+    assert cfg.max_pending is None
+    assert cfg.max_batch_bytes is None
+
+
+def test_new_fields_defaults_target():
+    """TargetConfig gains the same three fields with the same defaults."""
+    t = TargetConfig(name="a", tables=("t",))
+    assert t.max_attempts == 10
+    assert t.max_pending is None
+    assert t.max_batch_bytes is None
+
+
+def test_new_fields_settable():
+    """The three new fields accept explicit values on both dataclasses."""
+    cfg = OutboxConfig(db_dir=Path("/tmp"), max_attempts=None, max_pending=1000,
+                       max_batch_bytes=1_048_576)
+    assert cfg.max_attempts is None
+    assert cfg.max_pending == 1000
+    assert cfg.max_batch_bytes == 1_048_576
+
+    t = TargetConfig(name="a", tables=("t",), max_attempts=None, max_pending=500,
+                     max_batch_bytes=2048)
+    assert t.max_attempts is None
+    assert t.max_pending == 500
+    assert t.max_batch_bytes == 2048
+
+
+@pytest.mark.parametrize(
+    "kwargs, bad_field",
+    [
+        ({"batch_size": 0}, "batch_size"),
+        ({"flush_interval": 0}, "flush_interval"),
+        ({"flush_interval": -1.0}, "flush_interval"),
+        ({"table_flush_threshold": 0}, "table_flush_threshold"),
+        ({"table_max_wait": -0.1}, "table_max_wait"),
+        ({"cleanup_every": 0}, "cleanup_every"),
+        ({"retain_log_days": -1}, "retain_log_days"),
+        ({"max_pending": 0}, "max_pending"),
+        ({"max_attempts": 0}, "max_attempts"),
+    ],
+)
+def test_outbox_config_validation_rejects(kwargs, bad_field):
+    """Each out-of-range OutboxConfig field raises ConfigError naming that field."""
+    with pytest.raises(ConfigError) as ei:
+        OutboxConfig(db_dir=Path("/tmp"), **kwargs)
+    assert ei.value.field == bad_field
+
+
+def test_outbox_config_validation_accepts_boundaries():
+    """The smallest legal values construct fine (boundary check)."""
+    cfg = OutboxConfig(
+        db_dir=Path("/tmp"),
+        batch_size=1,
+        flush_interval=0.001,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        cleanup_every=1,
+        retain_log_days=0,
+        max_pending=1,
+        max_attempts=1,
+    )
+    assert cfg.batch_size == 1
+    assert cfg.table_max_wait == 0.0
+    assert cfg.retain_log_days == 0
+
+
+def test_outbox_config_none_disables_caps():
+    """max_pending=None and max_attempts=None are valid (opt-out)."""
+    cfg = OutboxConfig(db_dir=Path("/tmp"), max_pending=None, max_attempts=None)
+    assert cfg.max_pending is None
+    assert cfg.max_attempts is None
+
+
+@pytest.mark.parametrize(
+    "kwargs, bad_field",
+    [
+        ({"batch_size": 0}, "batch_size"),
+        ({"retain_log_days": -1}, "retain_log_days"),
+        ({"max_pending": 0}, "max_pending"),
+        ({"max_attempts": 0}, "max_attempts"),
+    ],
+)
+def test_target_config_validation_rejects(kwargs, bad_field):
+    """Each out-of-range TargetConfig field raises ConfigError naming that field."""
+    with pytest.raises(ConfigError) as ei:
+        TargetConfig(name="a", tables=("t",), **kwargs)
+    assert ei.value.field == bad_field
+
+
+def test_target_config_validation_rejects_bad_override_days():
+    """A negative per-table retain override is rejected, naming retain_log_days."""
+    with pytest.raises(ConfigError) as ei:
+        TargetConfig(name="a", tables=("t",),
+                     table_retain_overrides=(("t", -5),))
+    assert ei.value.field == "retain_log_days"
+
+
+def test_target_config_validation_accepts_boundaries():
+    """Smallest legal TargetConfig values construct fine."""
+    t = TargetConfig(name="a", tables=("t",), batch_size=1, retain_log_days=0,
+                     max_pending=1, max_attempts=1)
+    assert t.batch_size == 1
+    assert t.retain_log_days == 0

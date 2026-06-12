@@ -45,13 +45,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Any, Protocol, runtime_checkable
 
 from sqloutbox._outbox import Outbox
 from sqloutbox._verify import VerifyResult, verify_all
 from sqloutbox.config import OutboxConfig, TargetConfig
+from sqloutbox.exceptions import UnsupportedStatementError
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,98 @@ class OutboxWriter(Protocol):
 # ── SQL helpers ──────────────────────────────────────────────────────────────
 
 
+def _mask_string_literals(sql: str) -> str:
+    """Return ``sql`` with the *contents* of quoted string literals blanked.
+
+    Replaces every character inside a single- or double-quoted literal with a
+    space, leaving the quote characters and all structural SQL outside the
+    literals intact. SQL's doubled-quote escape ('' inside a '…' literal, and
+    "" inside a "…") is handled — a doubled quote does NOT close the literal.
+
+    The result (the "skeleton") has the SAME LENGTH and SAME structural-char
+    positions as the input, so index/count scans (find, rfind, count('?'))
+    on the skeleton map 1:1 back onto the original string — but a '?' / ')' /
+    'WHERE' that lived inside a literal is now a space and cannot mislead them.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    quote = ""  # "" when outside a literal; "'" or '"' when inside one
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                # A doubled quote ('' or "") is an escape — stays inside the literal.
+                if i + 1 < n and sql[i + 1] == quote:
+                    out.append(quote)
+                    out.append(quote)
+                    i += 2
+                    continue
+                out.append(quote)   # closing quote
+                quote = ""
+                i += 1
+                continue
+            out.append(" ")          # blank the literal content
+            i += 1
+            continue
+        if ch == "'" or ch == '"':
+            quote = ch
+            out.append(ch)           # opening quote
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _assert_supported(sql: str, masked: str) -> None:
+    """Raise UnsupportedStatementError unless ``sql`` is a safe INSERT/UPDATE.
+
+    ``masked`` is ``_mask_string_literals(sql)`` — structural scanning runs on
+    it so a ')' / '?' / WHERE inside a string literal cannot fool the checks.
+
+    Supported (and ONLY these):
+        INSERT INTO t (cols) VALUES (?, …)     -- single-row, explicit columns
+        UPDATE t SET c=? [, …] WHERE …          -- at least one real SET arg
+    """
+    upper = masked.upper().strip()
+
+    if upper.startswith("INSERT"):
+        vi = upper.find(") VALUES")
+        if vi == -1:
+            raise UnsupportedStatementError(
+                f"INSERT must be single-row 'INSERT INTO t (cols) VALUES (...)'; "
+                f"got: {sql!r}"
+            )
+        after = upper[vi + len(") VALUES"):]
+        # Multi-row VALUES: a second '(' opens after the first VALUES group closes.
+        first_close = after.find(")")
+        if first_close != -1 and "(" in after[first_close + 1:]:
+            raise UnsupportedStatementError(
+                f"multi-row VALUES is not supported (one row per statement); "
+                f"got: {sql!r}"
+            )
+        return
+
+    if upper.startswith("UPDATE"):
+        where_idx = upper.find(" WHERE ")
+        set_part = masked[:where_idx] if where_idx != -1 else masked
+        # The transform inserts ', outbox_seq = ?' after the real SET args. If
+        # the skeleton has no real '?' in SET, the original only had a literal
+        # '?' — ambiguous; reject rather than emit wrong SQL.
+        if set_part.count("?") < 1:
+            raise UnsupportedStatementError(
+                f"UPDATE SET clause has no bind placeholder (a '?' inside a "
+                f"string literal does not count); got: {sql!r}"
+            )
+        return
+
+    raise UnsupportedStatementError(
+        f"only single-row INSERT … VALUES (…) and UPDATE … SET …=? are "
+        f"supported by inject_outbox_seq; got: {sql!r}"
+    )
+
+
 def inject_outbox_seq(
     sql: str, args: list[Any], outbox_seq: int,
 ) -> tuple[str, list[Any]]:
@@ -140,39 +235,104 @@ def inject_outbox_seq(
     (modified_sql, modified_args)
     """
     s = sql.strip()
-    upper = s.upper()
+    # Mask string-literal contents so a ')' / '?' / WHERE inside a literal cannot
+    # mislead the structural scans below, then reject any unsupported shape.
+    masked = _mask_string_literals(s)
+    _assert_supported(s, masked)
+
+    upper = masked.upper()
 
     if upper.startswith("INSERT"):
-        # Convert INSERT INTO → INSERT OR IGNORE INTO
+        # Convert INSERT INTO → INSERT OR IGNORE INTO (operate on the original s;
+        # the prefix length is identical in s and the skeleton).
         if upper.startswith("INSERT INTO"):
             s = "INSERT OR IGNORE INTO" + s[len("INSERT INTO"):]
-        # Insert outbox_seq column before ) VALUES
-        vi = s.upper().find(") VALUES")
-        if vi != -1:
-            s = s[:vi] + ", outbox_seq" + s[vi:]
-        # Insert ? placeholder before last )
-        lp = s.rfind(")")
-        if lp != -1:
-            s = s[:lp] + ", ?" + s[lp:]
+            masked = "INSERT OR IGNORE INTO" + masked[len("INSERT INTO"):]
+        upper = masked.upper()
+        # Insert outbox_seq column before ') VALUES' (index from the skeleton).
+        vi = upper.find(") VALUES")
+        s = s[:vi] + ", outbox_seq" + s[vi:]
+        masked = masked[:vi] + ", outbox_seq" + masked[vi:]
+        # Insert '?' placeholder before the LAST ')' of the VALUES group. On the
+        # skeleton the only ')' chars are structural, so rfind is now safe.
+        lp = masked.rfind(")")
+        s = s[:lp] + ", ?" + s[lp:]
         return s, list(args) + [outbox_seq]
 
-    if upper.startswith("UPDATE"):
-        where_idx = upper.find(" WHERE ")
-        if where_idx != -1:
-            # Count ? placeholders in SET clause (before WHERE)
-            set_part = s[:where_idx]
-            n_set_args = set_part.count("?")
-            # Inject outbox_seq=? before WHERE
-            s = s[:where_idx] + ", outbox_seq = ?" + s[where_idx:]
-            new_args = list(args)
-            new_args.insert(n_set_args, outbox_seq)
-            return s, new_args
-        # No WHERE clause — append to SET
-        s = s + ", outbox_seq = ?"
-        return s, list(args) + [outbox_seq]
-
-    # Unknown statement type — return unchanged
+    # UPDATE (the only other shape _assert_supported lets through).
+    where_idx = upper.find(" WHERE ")
+    if where_idx != -1:
+        # Count real '?' placeholders in the SET clause via the skeleton.
+        n_set_args = masked[:where_idx].count("?")
+        s = s[:where_idx] + ", outbox_seq = ?" + s[where_idx:]
+        new_args = list(args)
+        new_args.insert(n_set_args, outbox_seq)
+        return s, new_args
+    # No WHERE — append outbox_seq to the SET clause.
+    s = s + ", outbox_seq = ?"
     return s, list(args) + [outbox_seq]
+
+
+def classify_write_error(error: str | None) -> str:
+    """Classify a destination write error per FIRST spec §3.3.
+
+    Returns one of: TRANSIENT | DETERMINISTIC | ALREADY_APPLIED | UNKNOWN.
+    Substring-based and conservative — UNKNOWN is the safe default (retry).
+    Classification changes REPORTING only: no class drops data. ALREADY_APPLIED
+    is the single class the drain treats as success (a UNIQUE collision on an
+    idempotent INSERT proves the row's key already exists at the destination).
+    """
+    if not error:
+        return "UNKNOWN"
+    e = error.lower()
+
+    # ALREADY_APPLIED first: a UNIQUE/duplicate-key collision means the row is
+    # provably present at the destination (idempotent INSERT OR IGNORE). Checked
+    # before DETERMINISTIC because "constraint" also appears in FK/NOT NULL text.
+    if "unique constraint" in e or "duplicate key" in e or "already exists" in e:
+        return "ALREADY_APPLIED"
+
+    # TRANSIENT: network / 5xx / timeout / contended lock — retry with backoff.
+    if (
+        "timeout" in e or "timed out" in e
+        or "connection" in e or "reset" in e
+        or "temporarily unavailable" in e or "503" in e or "502" in e
+        or "504" in e or "database is locked" in e or "busy" in e
+    ):
+        return "TRANSIENT"
+
+    # DETERMINISTIC: schema / SQL faults — retry w/ backoff (may clear after a
+    # destination migration or once a prior row lands), but never dropped.
+    if (
+        "foreign key" in e or "not null" in e
+        or "no such column" in e or "no such table" in e
+        or "syntax error" in e or "constraint failed" in e
+    ):
+        return "DETERMINISTIC"
+
+    return "UNKNOWN"
+
+
+def _backoff_eligible(attempts: int, last_attempt_at: str | None, cap_minutes: int) -> bool:
+    """Return True if a stuck head is eligible to retry now (§3.2 backoff gate).
+
+    delay = min(2^attempts, cap) minutes after last_attempt_at (UTC ISO).
+    A missing/unparseable/future last_attempt_at → eligible now (never stall
+    forever — fail open, the row is retried rather than stranded).
+    """
+    if attempts <= 0 or not last_attempt_at:
+        return True
+    try:
+        last = datetime.fromisoformat(last_attempt_at)
+    except ValueError:
+        return True
+    delay = timedelta(minutes=min(2 ** attempts, cap_minutes))
+    next_eligible = last + delay
+    now = datetime.now(timezone.utc)
+    # last_attempt_at in the future (clock skew) → treat as eligible.
+    if next_eligible <= now or last > now:
+        return True
+    return False
 
 
 # ── Sync service ─────────────────────────────────────────────────────────────
@@ -208,6 +368,26 @@ class OutboxSyncService:
         self._writers = writers
         self._flush_interval = config.flush_interval
         self._cycle_count = 0
+
+        # WS-6 log hygiene (F040/F041): namespaces currently in the "stuck" state.
+        # WARN once on the not-stuck → stuck transition; INFO once on recovery.
+        self._stuck_namespaces: set[str] = set()
+
+        # WS-4 §5.2: cooperative shutdown. request_stop() sets this; the worker
+        # checks it at the TOP of each cycle and returns cleanly (no new cycle).
+        self._stopping = asyncio.Event()
+
+        # WS-4 §5.3: fail fast on a writerless target. Without a writer the
+        # worker would silently `continue` past it forever — every row to that
+        # target black-holed with no signal. Surface the misconfiguration at
+        # construction instead. (Empty targets is fine — middleware-only use.)
+        missing = [t.name for t in config.targets if t.name not in writers]
+        if missing:
+            raise ValueError(
+                "OutboxSyncService: no writer provided for target(s) "
+                f"{missing}. Every config.targets entry must have a matching "
+                f"key in `writers`. Provided writers: {sorted(writers)}."
+            )
 
         # Verification support — request_verify() sets the event,
         # worker loop checks it between drain cycles.
@@ -278,6 +458,18 @@ class OutboxSyncService:
         await self._ensure_schema()
         await self._seed_from_remote()
         await self._worker_loop()
+
+    def request_stop(self) -> None:
+        """Ask the worker to stop after the current cycle finishes.
+
+        WS-4 §5.2: cooperative shutdown. The worker checks this flag at the TOP
+        of each cycle and returns cleanly — it never starts a new cycle once set.
+        An in-flight cycle's confirm step (mark_synced + delete_synced for an
+        already-delivered batch) runs under asyncio.shield so it completes even
+        if a cancel arrives. At-least-once is still the honest guarantee; this
+        only prevents ROUTINE SIGTERM from manufacturing duplicates.
+        """
+        self._stopping.set()
 
     # ── Schema setup ────────────────────────────────────────────────────────
 
@@ -526,6 +718,11 @@ class OutboxSyncService:
         max_wait = self._config.table_max_wait
 
         while True:
+            if self._stopping.is_set():
+                logger.info(
+                    "[outbox_sync] stop requested — worker loop exiting cleanly",
+                )
+                return
             await asyncio.sleep(self._flush_interval)
 
             # ── Verification hook ───────────────────────────────────
@@ -561,11 +758,36 @@ class OutboxSyncService:
                 stmt_info: list[tuple[str, int]] = []   # (table, outbox_seq)
                 all_stmts: list[tuple[str, list[Any]]] = []
                 flushed_tables: list[str] = []
+                cycle_payload_bytes: int = 0  # running payload byte total for this target
 
                 for table, outbox in outboxes.items():
+                  try:
                     pending = outbox.pending_count()
                     if pending == 0:
                         continue
+
+                    # ── WS-1 backoff gate ────────────────────────────────
+                    # A stuck head (attempts>0) is suppressed until its
+                    # min(2^attempts, cap) backoff has elapsed — regardless of
+                    # the threshold / max_wait triggers below. While stuck we
+                    # fetch ONLY the head (limit=1) so nothing behind it can
+                    # leapfrog (the no-skip / head-of-line invariant, §3.2).
+                    cap_minutes = self._config.backoff_cap_minutes
+                    head = outbox.peek_head()
+                    head_stuck = bool(head and head.attempts > 0)
+                    if head_stuck:
+                        assert head is not None  # implied by head_stuck=True
+                        if not _backoff_eligible(
+                            head.attempts, head.last_attempt_at, cap_minutes,
+                        ):
+                            if logger.isEnabledFor(_VERBOSE):
+                                logger.log(
+                                    _VERBOSE,
+                                    "[outbox_sync] backoff: table='%s' head seq=%d "
+                                    "attempts=%d not yet eligible — skipping",
+                                    table, head.seq, head.attempts,
+                                )
+                            continue
 
                     elapsed = now - last_flush.get(table, 0.0)
 
@@ -581,9 +803,34 @@ class OutboxSyncService:
                         continue
 
                     # ── Table is ready — fetch rows ──────────────────────
-                    rows = await asyncio.to_thread(outbox.fetch_unsynced)
+                    # Head-of-line hold: while the head is stuck, fetch ONLY it
+                    # (limit=1). A healthy namespace fetches a normal batch.
+                    if head_stuck:
+                        rows = await asyncio.to_thread(outbox.fetch_unsynced, 1)
+                    else:
+                        rows = await asyncio.to_thread(outbox.fetch_unsynced)
                     if not rows:
                         continue
+
+                    # ── max_batch_bytes byte-budget check ────────────────
+                    # Effective limit: per-target override (if set) else global.
+                    # None = unlimited. If adding this table's rows would exceed
+                    # the budget, skip it this cycle — it will be picked up next.
+                    effective_max_bytes = (
+                        target.max_batch_bytes
+                        if target.max_batch_bytes is not None
+                        else self._config.max_batch_bytes
+                    )
+                    if effective_max_bytes is not None:
+                        table_bytes = sum(len(row.payload) for row in rows)
+                        if cycle_payload_bytes + table_bytes > effective_max_bytes:
+                            logger.debug(
+                                "[outbox_sync] table='%s' skipped this cycle "
+                                "(byte budget: %d + %d > %d)",
+                                table, cycle_payload_bytes, table_bytes,
+                                effective_max_bytes,
+                            )
+                            continue
 
                     trigger = "threshold" if pending >= threshold else "max_wait"
                     logger.debug(
@@ -605,14 +852,54 @@ class OutboxSyncService:
                         continue
 
                     for row in rows:
-                        sql = row.tag
-                        args = json.loads(row.payload.decode())
-                        if target.should_inject_seq(table):
-                            sql, args = inject_outbox_seq(sql, args, row.seq)
+                        try:
+                            sql = row.tag
+                            args = json.loads(row.payload.decode())
+                            if target.should_inject_seq(table):
+                                sql, args = inject_outbox_seq(sql, args, row.seq)
+                        except Exception as exc:
+                            # L1 (WS-2 upgrade): an undecodable / untransformable
+                            # payload can never succeed — dead-letter it now instead
+                            # of retrying forever. The move is atomic (Outbox.dead_letter);
+                            # the row is quarantined + replayable, never lost. The
+                            # namespace then advances cleanly on the next fetch.
+                            # reason='unsupported_stmt' for grammar-rejected rows
+                            # (UnsupportedStatementError); 'undecodable' for all else.
+                            reason = (
+                                "unsupported_stmt"
+                                if isinstance(exc, UnsupportedStatementError)
+                                else "undecodable"
+                            )
+                            logger.error(
+                                "[outbox_sync] dead-lettering undecodable row "
+                                "table='%s' seq=%d: %s",
+                                table, row.seq, exc,
+                            )
+                            await asyncio.to_thread(
+                                outbox.dead_letter, row.seq, reason,
+                            )
+                            continue
                         all_stmts.append((sql, args))
                         stmt_info.append((table, row.seq))
 
                     flushed_tables.append(table)
+                    cycle_payload_bytes += sum(len(row.payload) for row in rows)
+                  except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+                    # L2: isolate a corrupt/locked namespace. Skip it THIS cycle;
+                    # sibling tables keep draining. (Transient lock → retries next
+                    # cycle; structural corruption → keeps logging until repaired.)
+                    logger.error(
+                        "[outbox_sync] table='%s' skipped this cycle (db error): %s",
+                        table, exc,
+                    )
+                    continue
+                  except Exception as exc:
+                    # Any other per-table fault must not escape the loop either.
+                    logger.exception(
+                        "[outbox_sync] table='%s' skipped this cycle (unexpected): %s",
+                        table, exc,
+                    )
+                    continue
 
                 if all_stmts:
                     any_flushed = True
@@ -638,7 +925,17 @@ class OutboxSyncService:
         target_name: str,
         cycle_start: float,
     ) -> None:
-        """Send a batch of statements to a target and confirm delivery."""
+        """Send a batch and confirm delivery HEAD-FIRST per namespace.
+
+        WS-1 head-of-line hold: rows are grouped by namespace and confirmed in
+        seq order. Confirmation STOPS at the first non-ok row in a namespace —
+        later rows do NOT leapfrog a failed predecessor. The failed head is
+        classified (§3.3), its attempt recorded (§3.1), and:
+          * ALREADY_APPLIED → treated as delivered (advance the head).
+          * else, max_attempts hit → dead-lettered reason='max_attempts' (D1),
+            namespace unblocks.
+          * else → held; the §3.2 backoff gate (in _worker_loop) defers its retry.
+        """
         logger.debug(
             "[outbox_sync] cycle #%d  sending %d rows across %d tables to %s",
             self._cycle_count, len(stmts),
@@ -658,47 +955,122 @@ class OutboxSyncService:
             return
         write_ms = (time.monotonic() - t_write) * 1000
 
-        confirmed_by_table: dict[str, list[int]] = defaultdict(list)
-        failed_count = 0
+        # Group (result, seq) by namespace, preserving the batch order (which is
+        # seq order — _worker_loop fetched ORDER BY seq).
+        by_table: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         for i, result in enumerate(results):
             table, outbox_seq = stmt_info[i]
-            if result["ok"]:
-                confirmed_by_table[table].append(outbox_seq)
-            else:
-                failed_count += 1
-                logger.warning(
-                    "[outbox_sync] %s write failed for '%s' seq=%d: %s",
-                    target_name, table, outbox_seq, result.get("error", ""),
-                )
+            by_table[table].append((outbox_seq, result))
 
+        max_attempts = self._config.max_attempts
         total_confirmed = 0
-        for table, seqs in confirmed_by_table.items():
+        total_failed = 0
+        total_dead = 0
+
+        for table, items in by_table.items():
             outbox = outboxes[table]
-            await asyncio.to_thread(outbox.mark_synced, seqs)
-            await asyncio.to_thread(outbox.delete_synced, seqs)
-            total_confirmed += len(seqs)
-            if logger.isEnabledFor(_VERBOSE):
-                logger.log(
-                    _VERBOSE,
-                    "[outbox_sync]   confirmed %s table='%s'  %d rows  "
-                    "seqs=%s",
-                    target_name, table, len(seqs), seqs[:10],
+            confirmed: list[int] = []
+            # Walk this namespace's rows in seq order; stop at the first hold.
+            for seq, result in items:
+                if result.get("ok"):
+                    confirmed.append(seq)
+                    continue
+
+                # First non-ok row → classify and decide head's fate.
+                err = result.get("error", "") or ""
+                err_class = classify_write_error(err)
+
+                if err_class == "ALREADY_APPLIED":
+                    # The row's key already exists at the destination — success.
+                    # Confirm it and keep walking (it does NOT block successors).
+                    confirmed.append(seq)
+                    logger.info(
+                        "[outbox_sync] %s '%s' seq=%d already applied — advancing",
+                        target_name, table, seq,
+                    )
+                    continue
+
+                # A genuine failure: HOLD. Record the attempt, then either
+                # dead-letter (cap hit) or stop confirming this namespace.
+                # record_attempt returns the new count for THIS seq. We must use
+                # it (not peek_head()) — in a mixed batch an earlier confirmed-ok
+                # row in this namespace is not yet mark_synced, so peek_head()
+                # would point at it (attempts=0), mis-reporting the failing row.
+                attempts_now = await asyncio.to_thread(
+                    outbox.record_attempt, seq, err, err_class,
                 )
+                if max_attempts is not None and attempts_now >= max_attempts:
+                    moved = await asyncio.to_thread(
+                        outbox.dead_letter, seq, "max_attempts",
+                    )
+                    if moved:
+                        total_dead += 1
+                        logger.warning(
+                            "[outbox_sync] dead-lettered ns=%s seq=%s after %d "
+                            "attempts: %s",
+                            table, seq, attempts_now, err,
+                        )
+                    # Namespace unblocks — clear stuck state so a later re-stick re-WARNs.
+                    self._stuck_namespaces.discard(table)
+                    # We deliberately do NOT continue confirming rows sent AFTER this one
+                    # in the same batch: let the next cycle re-fetch from the new head.
+                    total_failed += 1
+                    break
+                else:
+                    # Per-retry detail → DEBUG (the backoff gate already paces these).
+                    logger.debug(
+                        "[outbox_sync] %s '%s' seq=%d held (attempt %d, class=%s): %s",
+                        target_name, table, seq, attempts_now, err_class, err,
+                    )
+                    # F040/F041: WARN ONCE on the not-stuck → stuck transition.
+                    if table not in self._stuck_namespaces:
+                        self._stuck_namespaces.add(table)
+                        logger.warning(
+                            "[outbox_sync] namespace stuck: '%s' on target '%s' "
+                            "(head seq=%d, attempt %d, class=%s): %s",
+                            table, target_name, seq, attempts_now, err_class, err,
+                        )
+                    total_failed += 1
+                    break
+
+            if confirmed:
+                # WS-4 §5.2: write_batch already returned ok for these seqs — the
+                # remote has the rows. Confirm locally under shield so a shutdown
+                # cancel cannot land BETWEEN delivery and local cleanup (which would
+                # redeliver on restart). Shield protects the await from cancellation.
+                async def _confirm(ob=outbox, ss=confirmed):
+                    await asyncio.to_thread(ob.mark_synced, ss)
+                    await asyncio.to_thread(ob.delete_synced, ss)
+
+                await asyncio.shield(_confirm())
+                total_confirmed += len(confirmed)
+                # F041: if this namespace was stuck and now delivered, it has recovered.
+                if table in self._stuck_namespaces:
+                    self._stuck_namespaces.discard(table)
+                    logger.info(
+                        "[outbox_sync] namespace recovered: '%s' on target '%s'",
+                        table, target_name,
+                    )
+                if logger.isEnabledFor(_VERBOSE):
+                    logger.log(
+                        _VERBOSE,
+                        "[outbox_sync]   confirmed %s table='%s'  %d rows  seqs=%s",
+                        target_name, table, len(confirmed), confirmed[:10],
+                    )
 
         cycle_ms = (time.monotonic() - cycle_start) * 1000
-        if total_confirmed:
+        if total_confirmed or total_failed or total_dead:
             level = (
                 logging.INFO
-                if (total_confirmed >= 10 or failed_count)
+                if (total_confirmed >= 10 or total_failed or total_dead)
                 else logging.DEBUG
             )
             logger.log(
                 level,
-                "[outbox_sync] cycle #%d  %s delivered=%d  failed=%d  "
+                "[outbox_sync] cycle #%d  %s delivered=%d  held=%d  dead=%d  "
                 "tables=%s  write=%.0fms  cycle=%.0fms",
-                self._cycle_count, target_name, total_confirmed, failed_count,
-                list(confirmed_by_table.keys()),
-                write_ms, cycle_ms,
+                self._cycle_count, target_name, total_confirmed, total_failed,
+                total_dead, list(by_table.keys()), write_ms, cycle_ms,
             )
 
     # ── Maintenance ──────────────────────────────────────────────────────────

@@ -207,6 +207,74 @@ async def test_broken_writer_isolated_siblings_drain(tmp_path: Path):
     assert any("good" in s for s, _ in good.delivered)
 
 
+@pytest.mark.asyncio
+async def test_shield_protects_confirm_from_mid_flight_cancel(tmp_path: Path):
+    """asyncio.shield lets the confirm (mark+delete) finish even when the drain
+    task is cancelled mid-flight.
+
+    asyncio.shield semantics: the INNER coroutine keeps running after a cancel
+    lands on the outer task — it is not cancelled — but the await at the call
+    site raises CancelledError immediately. The shielded inner coroutine
+    completes in the background on the event loop. We must yield control after
+    cancelling to let it finish before asserting.
+
+    Mechanism under test: _flush_to_target line `await asyncio.shield(_confirm())`
+    Contract: once write_batch returns ok, the local delete MUST complete even
+    if a SIGTERM/cancel arrives before mark_synced runs.
+    """
+    write_returned = asyncio.Event()
+
+    class _SignallingWriter:
+        """Returns ok results and signals the moment write_batch returns — so the
+        test can cancel at the precise worst-case window: after remote delivery,
+        before local confirm."""
+        async def write_batch(self, stmts):
+            results = [{"ok": True} for _ in stmts]
+            write_returned.set()  # signal: remote delivery complete
+            return results
+
+    writer = _SignallingWriter()
+    cfg = OutboxConfig(
+        db_dir=tmp_path,
+        targets=(TargetConfig(name="primary", tables=("evt",),
+                              inject_outbox_seq=False),),
+        flush_interval=0.01,
+        table_flush_threshold=1,
+        table_max_wait=0.0,
+        auto_schema=False,
+    )
+    svc = OutboxSyncService(config=cfg, writers={"primary": writer})
+
+    Outbox(db_path=tmp_path / "evt.db", namespace="evt").enqueue(
+        "INSERT INTO evt (a) VALUES (?)", json.dumps([1]).encode()
+    )
+
+    task = asyncio.create_task(svc.run())
+
+    # Wait until write_batch has returned (remote delivery confirmed).
+    await asyncio.wait_for(write_returned.wait(), timeout=2.0)
+
+    # Cancel the drain task at the worst-case moment: after write_batch ok,
+    # before or during the shielded confirm. The shield must let mark+delete finish.
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # asyncio.shield runs the inner coroutine to completion on the event loop
+    # even after the outer task is cancelled. Give the loop a few ticks to
+    # finish any pending callbacks from the shielded coroutine.
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    assert ob.pending_count() == 0, (
+        "Row still pending — the shielded confirm did not complete after cancel. "
+        "This means asyncio.shield is not protecting the mark_synced+delete_synced path."
+    )
+
+
 def test_acquire_lock_noop_when_fcntl_unavailable(tmp_path: Path, monkeypatch):
     """On a platform without fcntl, the lock is a no-op (returns None) and WARNs —
     single-drain is not enforced, matching the documented Windows behavior."""

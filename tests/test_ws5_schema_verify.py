@@ -340,6 +340,111 @@ def test_seeded_producer_then_read_only_verify_clean(tmp_path: Path):
     assert result.seq_range[0] > 500  # all seqs above the seeded floor
 
 
+def test_record_hwm_failure_does_not_roll_back_enqueue(tmp_path: Path):
+    """record_hwm failing after commit must NOT roll back or drop the enqueued row.
+
+    record_hwm is non-fatal by design: it has its own try/except that logs a
+    WARNING and returns. The critical invariant is that a failure there cannot
+    reach the enqueue() except block and trigger rollback + return None on an
+    already-committed row.
+
+    We simulate the failure by dropping the outbox_hwm table after the Outbox is
+    constructed (so the real record_hwm code path — with its own exception
+    swallowing — is exercised, not a monkeypatched stub).
+    """
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+
+    # Drop outbox_hwm so the next record_hwm call raises OperationalError internally.
+    ob._write_conn.execute("DROP TABLE outbox_hwm")
+    ob._write_conn.commit()
+
+    # enqueue must NOT raise and must NOT return None — the INSERT committed.
+    seq = ob.enqueue("INSERT INTO evt (a) VALUES (?)", b"[1]")
+
+    # The row is committed and present in the queue despite the HWM failure.
+    assert seq is not None, (
+        "enqueue returned None — a record_hwm failure leaked into the enqueue "
+        "error path and either triggered rollback or masked the committed row"
+    )
+    assert ob.pending_count() == 1
+
+
+def test_enqueue_batch_hwm_is_highest_seq_in_batch(tmp_path: Path):
+    """enqueue_batch records the HWM as the LAST (highest) seq in the batch.
+
+    A batch of N items produces seqs [start, start+1, ..., start+N-1].
+    The persisted HWM must equal start+N-1 (the highest), not start (the first).
+    A bug that called record_hwm(start_seq) instead of record_hwm(last_seq) would
+    cause a fresh-host producer to start numbering from a too-low floor, risking
+    silent DROP on INSERT OR IGNORE for batch items after the first.
+    """
+    ob = Outbox(db_path=tmp_path / "evt.db", namespace="evt")
+    seqs = ob.enqueue_batch([("t", b"a"), ("t", b"b"), ("t", b"c"), ("t", b"d")])
+    assert len(seqs) == 4
+    assert ob._persisted_hwm() == max(seqs), (
+        f"HWM must equal highest seq {max(seqs)}, got {ob._persisted_hwm()}"
+    )
+
+
+def test_persisted_hwm_returns_zero_when_outbox_hwm_table_absent(tmp_path: Path):
+    """_persisted_hwm returns 0 (never crashes) when the outbox_hwm table is absent.
+
+    Pre-WS-5 databases do not have the outbox_hwm table. The tolerance path
+    (except Exception: return 0) must fire silently so opening an old DB with a
+    fresh Outbox does not crash the hot path.
+    """
+    db = tmp_path / "old.db"
+    # Build a minimal outbox DB by hand — WITHOUT the outbox_hwm table.
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE outbox_queue ("
+        "  seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  created_at TEXT NOT NULL,"
+        "  namespace  TEXT NOT NULL,"
+        "  source     TEXT NOT NULL DEFAULT '',"
+        "  tag        TEXT NOT NULL,"
+        "  payload    TEXT NOT NULL,"
+        "  prev_seq   INTEGER UNIQUE,"
+        "  synced     INTEGER NOT NULL DEFAULT 0,"
+        "  attempts   INTEGER NOT NULL DEFAULT 0,"
+        "  last_attempt_at TEXT,"
+        "  last_error TEXT,"
+        "  last_error_class TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE outbox_sync_log ("
+        "  seq INTEGER PRIMARY KEY,"
+        "  namespace TEXT NOT NULL,"
+        "  synced_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE outbox_dead_log ("
+        "  seq INTEGER NOT NULL,"
+        "  namespace TEXT NOT NULL,"
+        "  tag TEXT NOT NULL,"
+        "  payload TEXT NOT NULL,"
+        "  prev_seq INTEGER,"
+        "  source TEXT,"
+        "  attempts INTEGER NOT NULL,"
+        "  last_error TEXT,"
+        "  last_error_class TEXT,"
+        "  dead_lettered_at TEXT NOT NULL,"
+        "  reason TEXT NOT NULL,"
+        "  PRIMARY KEY (namespace, seq)"
+        ")"
+    )
+    conn.commit()
+    conn.close()
+
+    # Outbox.__init__ opens a write connection; _seed_from_hwm calls _persisted_hwm.
+    # On a DB without outbox_hwm the SELECT raises OperationalError — must return 0.
+    # Constructing the Outbox must NOT raise, and _persisted_hwm must return 0.
+    ob = Outbox(db_path=db, namespace="evt")
+    assert ob._persisted_hwm() == 0
+
+
 def test_db_dir_verify_skips_foreign_and_missing(tmp_path: Path, capsys):
     """CLI --db-dir scan: a foreign file is reported FAIL, a healthy outbox OK, neither mutated."""
     from sqloutbox.cli import cmd_verify

@@ -195,6 +195,36 @@ def test_health_all_cross_process_read_while_writing(tmp_path: Path):
     assert health_all(tmp_path)[0].depth == 3
 
 
+def test_health_all_multi_namespace_same_file(tmp_path: Path):
+    """health_all returns one NamespaceHealth per NAMESPACE, not per file.
+
+    When two namespaces share a single .db file (the shared_outbox pattern),
+    health_all must enumerate both via SELECT DISTINCT namespace and return two
+    snapshots from the one file — not just one (the file stem).
+    """
+    from sqloutbox._outbox import health_all
+
+    shared = tmp_path / "shared.db"
+    # Write rows under two different namespaces into the SAME file.
+    Outbox(db_path=shared, namespace="alpha").enqueue(
+        "INSERT INTO alpha (a) VALUES (?)", b"[1]"
+    )
+    ob_beta = Outbox(db_path=shared, namespace="beta")
+    ob_beta.enqueue("INSERT INTO beta (a) VALUES (?)", b"[2]")
+    ob_beta.enqueue("INSERT INTO beta (a) VALUES (?)", b"[3]")
+
+    healths = health_all(tmp_path)
+    by_ns = {h.namespace: h for h in healths}
+
+    # Both namespaces must appear — not collapsed to the file stem.
+    assert "alpha" in by_ns, f"expected 'alpha' in {list(by_ns)}"
+    assert "beta" in by_ns, f"expected 'beta' in {list(by_ns)}"
+    assert by_ns["alpha"].depth == 1
+    assert by_ns["beta"].depth == 2
+    # Results are sorted by namespace.
+    assert [h.namespace for h in healths] == sorted(by_ns)
+
+
 def test_namespace_health_and_health_all_exported():
     """Public API: NamespaceHealth and health_all importable from package root."""
     import sqloutbox

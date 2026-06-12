@@ -139,10 +139,10 @@ class Outbox:
             assert cur.lastrowid is not None
             new_seq: int = cur.lastrowid
             self._write_conn.commit()
-            # Persist the high-water mark so a fresh producer on this host
-            # (mechanism (a)) re-seeds above it after a restart.
-            self.record_hwm(new_seq)
-            return new_seq
+            # Fall through to record_hwm OUTSIDE the try/except so a HWM
+            # failure (which is non-fatal by design) cannot be mis-classified
+            # as an enqueue failure and trigger rollback + return None on an
+            # already-committed row.
         except Exception as exc:
             try:
                 self._write_conn.rollback()
@@ -153,6 +153,12 @@ class Outbox:
                 self.namespace, exc,
             )
             return None
+        # Persist the high-water mark so a fresh producer on this host
+        # (mechanism (a)) re-seeds above it after a restart.
+        # Called AFTER the try/except so a HWM failure never hides a
+        # successful enqueue (the row is already committed at this point).
+        self.record_hwm(new_seq)
+        return new_seq
 
     def enqueue_batch(self, items: list[tuple[str, bytes]], source: str = "") -> list[int]:
         """Insert multiple events in one atomic transaction.

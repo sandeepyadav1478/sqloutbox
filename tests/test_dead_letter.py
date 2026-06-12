@@ -612,3 +612,76 @@ def test_cli_skip_moves_head(tmp_path: Path, capsys):
     assert ob2.pending_count() == 0
     dead = ob2.list_dead()
     assert len(dead) == 1 and dead[0].reason == "manual_skip"
+
+
+# ── _backoff_eligible: exact 2^attempts minute math ───────────────────────────
+
+from sqloutbox.sync import _backoff_eligible
+
+
+def _ts(offset_minutes: float) -> str:
+    """Return an ISO UTC timestamp offset_minutes from now (negative = past)."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)).isoformat()
+
+
+def test_backoff_eligible_zero_attempts_always_eligible():
+    """attempts=0 (never tried) → always eligible regardless of last_attempt_at."""
+    assert _backoff_eligible(0, _ts(-100), cap_minutes=64) is True
+    assert _backoff_eligible(0, None, cap_minutes=64) is True
+
+
+def test_backoff_eligible_no_timestamp_always_eligible():
+    """Missing last_attempt_at → fail-open: always eligible (never strand a row)."""
+    assert _backoff_eligible(3, None, cap_minutes=64) is True
+    assert _backoff_eligible(1, "", cap_minutes=64) is True
+
+
+def test_backoff_eligible_unparseable_timestamp_always_eligible():
+    """Unparseable last_attempt_at → fail-open: always eligible."""
+    assert _backoff_eligible(2, "not-a-date", cap_minutes=64) is True
+
+
+def test_backoff_eligible_attempts1_delay_2min():
+    """attempts=1 → delay = 2^1 = 2 minutes.
+
+    1 minute ago → NOT eligible (need 2 min gap).
+    3 minutes ago → eligible.
+    """
+    assert _backoff_eligible(1, _ts(-1), cap_minutes=64) is False
+    assert _backoff_eligible(1, _ts(-3), cap_minutes=64) is True
+
+
+def test_backoff_eligible_attempts2_delay_4min():
+    """attempts=2 → delay = 2^2 = 4 minutes.
+
+    3 minutes ago → NOT eligible.
+    5 minutes ago → eligible.
+    """
+    assert _backoff_eligible(2, _ts(-3), cap_minutes=64) is False
+    assert _backoff_eligible(2, _ts(-5), cap_minutes=64) is True
+
+
+def test_backoff_eligible_attempts3_delay_8min():
+    """attempts=3 → delay = 2^3 = 8 minutes.
+
+    1 minute ago → NOT eligible.
+    9 minutes ago → eligible.
+    """
+    assert _backoff_eligible(3, _ts(-1), cap_minutes=64) is False
+    assert _backoff_eligible(3, _ts(-9), cap_minutes=64) is True
+
+
+def test_backoff_eligible_cap_clamps_delay():
+    """cap_minutes clamps the exponential delay.
+
+    attempts=10 → 2^10 = 1024 min without cap; cap=64 clamps to 64 min.
+    63 minutes ago → NOT eligible (need 64).
+    65 minutes ago → eligible.
+    """
+    assert _backoff_eligible(10, _ts(-63), cap_minutes=64) is False
+    assert _backoff_eligible(10, _ts(-65), cap_minutes=64) is True
+
+
+def test_backoff_eligible_future_timestamp_is_eligible():
+    """last_attempt_at in the future (clock skew) → fail-open: eligible now."""
+    assert _backoff_eligible(5, _ts(+10), cap_minutes=64) is True

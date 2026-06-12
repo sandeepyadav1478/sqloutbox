@@ -777,6 +777,7 @@ class OutboxSyncService:
                     head = outbox.peek_head()
                     head_stuck = bool(head and head.attempts > 0)
                     if head_stuck:
+                        assert head is not None  # implied by head_stuck=True
                         if not _backoff_eligible(
                             head.attempts, head.last_attempt_at, cap_minutes,
                         ):

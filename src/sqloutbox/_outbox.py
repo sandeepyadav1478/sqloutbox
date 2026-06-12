@@ -5,6 +5,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqloutbox._verify import TableVerifyResult
 
 from sqloutbox._models import DeadRow, NamespaceHealth, QueueRow
 from sqloutbox._schema import (
@@ -744,7 +748,7 @@ class Outbox:
 
         Returns a :class:`TableVerifyResult` with ``ok=True`` if all checks pass.
         """
-        from sqloutbox._verify import TableVerifyResult, verify_outbox
+        from sqloutbox._verify import verify_outbox
         return verify_outbox(self)
 
     # ── Internal ─────────────────────────────────────────────────────────────

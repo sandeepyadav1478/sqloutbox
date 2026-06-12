@@ -139,6 +139,9 @@ class TargetConfig:
         if self.max_attempts is not None and self.max_attempts < 1:
             raise ConfigError("max_attempts", self.max_attempts,
                               "must be None or >= 1")
+        if self.max_batch_bytes is not None and self.max_batch_bytes < 1:
+            raise ConfigError("max_batch_bytes", self.max_batch_bytes,
+                              "must be None or >= 1")
         for _name, _days in self.table_retain_overrides:
             if _days < 0:
                 raise ConfigError("retain_log_days", _days,
@@ -225,9 +228,12 @@ class OutboxConfig:
     #   max_attempts:    D1 auto-dead-letter threshold (None = plateau-forever)
     #   max_pending:     D2 opt-in backpressure cap (None = unbounded, default)
     #   max_batch_bytes: optional memory bound (None = unbounded)
+    #   backoff_cap_minutes: cap (in minutes) for exponential backoff; controls
+    #       min(2^attempts, cap) delay between retries on stuck heads (§3.2)
     max_attempts: int | None = 10
     max_pending: int | None = None
     max_batch_bytes: int | None = None
+    backoff_cap_minutes: int = 64
 
     def __post_init__(self) -> None:
         """Validate tuning fields at construction (frozen dataclass).
@@ -260,6 +266,12 @@ class OutboxConfig:
         if self.max_attempts is not None and self.max_attempts < 1:
             raise ConfigError("max_attempts", self.max_attempts,
                               "must be None or >= 1")
+        if self.max_batch_bytes is not None and self.max_batch_bytes < 1:
+            raise ConfigError("max_batch_bytes", self.max_batch_bytes,
+                              "must be None or >= 1")
+        if self.backoff_cap_minutes < 1:
+            raise ConfigError("backoff_cap_minutes", self.backoff_cap_minutes,
+                              "must be >= 1")
 
     def tables_for_target(self, name: str) -> tuple[str, ...]:
         """Return table names routed to the named target."""

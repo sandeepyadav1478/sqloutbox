@@ -758,6 +758,7 @@ class OutboxSyncService:
                 stmt_info: list[tuple[str, int]] = []   # (table, outbox_seq)
                 all_stmts: list[tuple[str, list[Any]]] = []
                 flushed_tables: list[str] = []
+                cycle_payload_bytes: int = 0  # running payload byte total for this target
 
                 for table, outbox in outboxes.items():
                   try:
@@ -771,9 +772,7 @@ class OutboxSyncService:
                     # the threshold / max_wait triggers below. While stuck we
                     # fetch ONLY the head (limit=1) so nothing behind it can
                     # leapfrog (the no-skip / head-of-line invariant, §3.2).
-                    cap_minutes = getattr(
-                        self._config, "backoff_cap_minutes", 64,
-                    )
+                    cap_minutes = self._config.backoff_cap_minutes
                     head = outbox.peek_head()
                     head_stuck = bool(head and head.attempts > 0)
                     if head_stuck:
@@ -813,6 +812,26 @@ class OutboxSyncService:
                     if not rows:
                         continue
 
+                    # ── max_batch_bytes byte-budget check ────────────────
+                    # Effective limit: per-target override (if set) else global.
+                    # None = unlimited. If adding this table's rows would exceed
+                    # the budget, skip it this cycle — it will be picked up next.
+                    effective_max_bytes = (
+                        target.max_batch_bytes
+                        if target.max_batch_bytes is not None
+                        else self._config.max_batch_bytes
+                    )
+                    if effective_max_bytes is not None:
+                        table_bytes = sum(len(row.payload) for row in rows)
+                        if cycle_payload_bytes + table_bytes > effective_max_bytes:
+                            logger.debug(
+                                "[outbox_sync] table='%s' skipped this cycle "
+                                "(byte budget: %d + %d > %d)",
+                                table, cycle_payload_bytes, table_bytes,
+                                effective_max_bytes,
+                            )
+                            continue
+
                     trigger = "threshold" if pending >= threshold else "max_wait"
                     logger.debug(
                         "[outbox_sync] table='%s'  fetched=%d rows  "
@@ -840,24 +859,31 @@ class OutboxSyncService:
                                 sql, args = inject_outbox_seq(sql, args, row.seq)
                         except Exception as exc:
                             # L1 (WS-2 upgrade): an undecodable / untransformable
-                            # payload can never succeed — dead-letter it now
-                            # (reason='undecodable') instead of retrying forever.
-                            # The move is atomic (Outbox.dead_letter); the row is
-                            # quarantined + replayable, never lost. The namespace
-                            # then advances cleanly on the next fetch.
+                            # payload can never succeed — dead-letter it now instead
+                            # of retrying forever. The move is atomic (Outbox.dead_letter);
+                            # the row is quarantined + replayable, never lost. The
+                            # namespace then advances cleanly on the next fetch.
+                            # reason='unsupported_stmt' for grammar-rejected rows
+                            # (UnsupportedStatementError); 'undecodable' for all else.
+                            reason = (
+                                "unsupported_stmt"
+                                if isinstance(exc, UnsupportedStatementError)
+                                else "undecodable"
+                            )
                             logger.error(
                                 "[outbox_sync] dead-lettering undecodable row "
                                 "table='%s' seq=%d: %s",
                                 table, row.seq, exc,
                             )
                             await asyncio.to_thread(
-                                outbox.dead_letter, row.seq, "undecodable",
+                                outbox.dead_letter, row.seq, reason,
                             )
                             continue
                         all_stmts.append((sql, args))
                         stmt_info.append((table, row.seq))
 
                     flushed_tables.append(table)
+                    cycle_payload_bytes += sum(len(row.payload) for row in rows)
                   except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
                     # L2: isolate a corrupt/locked namespace. Skip it THIS cycle;
                     # sibling tables keep draining. (Transient lock → retries next
